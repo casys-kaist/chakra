@@ -1081,6 +1081,21 @@ class LLMChakraConverter:
                     layer_end = layer_num
             remain_layers -= 1
 
+    def convert_event(self, f: TextIOWrapper, num_layers: int):
+        layers: list[Layer] = self.get_layers(f)
+        for npu_id in range(self.num_npus):
+            output_filename = "%s.%d.eg" % (self.output_filename, npu_id)
+            with open(output_filename, "wb") as g:
+                for idx, layer in enumerate(layers):
+                    comp_node = self.get_comp_node(
+                    layer.name, 
+                    layer.comp_time,
+                    layer.input_memory_size,
+                    layer.weight_memory_size,
+                    layer.output_memory_size)
+                    layer.comp_node = comp_node
+                    encode_message(g, comp_node)
+
     def convert(self):
         with open(self.input_filename, "r") as f:
             first_line = f.readline().strip().split()
@@ -1113,5 +1128,7 @@ class LLMChakraConverter:
                 if num_npu_group <= 0:
                     raise ValueError(f"model_parallel_NPU_group <= 0")
                 self.convert_pim(f, num_layers, num_npu_group)
+            elif parallelism_type == "EVENT":
+                self.convert_event(f, num_layers)
             else:
                 raise ValueError(f"Unsupported parallelism type, {parallelism_type}")
