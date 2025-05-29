@@ -18,6 +18,7 @@ enum MemoryType
   INVALID_MEMORY = 0;
   LOCAL_MEMORY = 1;
   REMOTE_MEMORY = 2;
+  STORAGE_MEMORY = 3;
 }
 
 enum CollectiveCommType

@@ -1,10 +1,11 @@
 #include "et_feeder/et_feeder.h"
+#include <iostream>
 
 using namespace std;
 using namespace Chakra;
 
 ETFeeder::ETFeeder(string filename)
-  : trace_(filename), window_size_(4096), et_complete_(false) {
+  : trace_(filename), window_size_(10000000), et_complete_(false) {
   readNextWindow();
 }
 
@@ -144,4 +145,11 @@ void ETFeeder::readNextWindow() {
       dep_free_node_queue_.emplace(node);
     }
   }
+}
+
+void ETFeeder::printGraph() {
+    for (auto const &pair: dep_graph_) {
+        cout << "{" << pair.first << ": ";
+        pair.second->printNode();
+    }
 }

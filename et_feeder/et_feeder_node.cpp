@@ -37,3 +37,8 @@ void ETFeederNode::setDepUnresolvedParentIDs(
     vector<uint64_t> const& dep_unresolved_parent_ids) {
   dep_unresolved_parent_ids_ = dep_unresolved_parent_ids;
 }
+
+void ETFeederNode::printNode(){
+  cout << node_->name() << "}" << endl;
+}
+

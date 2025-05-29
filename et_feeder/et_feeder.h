@@ -22,6 +22,7 @@ class ETFeeder {
   void pushBackIssuableNode(uint64_t node_id);
   std::shared_ptr<ETFeederNode> lookupNode(uint64_t node_id);
   void freeChildrenNodes(uint64_t node_id);
+  void printGraph();
 
  private:
   std::shared_ptr<ETFeederNode> readNode();
@@ -32,7 +33,7 @@ class ETFeeder {
   const uint32_t window_size_;
   bool et_complete_;
 
-  std::unordered_map<uint64_t, std::shared_ptr<ETFeederNode>> dep_graph_{};
+  std::map<uint64_t, std::shared_ptr<ETFeederNode>> dep_graph_{};
   std::unordered_set<uint64_t> dep_free_node_id_set_{};
   std::queue<std::shared_ptr<ETFeederNode>> dep_free_node_queue_{};
   std::unordered_set<std::shared_ptr<ETFeederNode>> dep_unresolved_node_set_{};

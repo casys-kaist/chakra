@@ -17,6 +17,7 @@ class ETFeederNode {
     void addDepUnresolvedParentID(uint64_t node_id);
     std::vector<uint64_t> getDepUnresolvedParentIDs();
     void setDepUnresolvedParentIDs(std::vector<uint64_t> const& dep_unresolved_parent_ids);
+    void printNode();
 
   private:
     std::shared_ptr<ChakraProtoMsg::Node> node_{nullptr};
