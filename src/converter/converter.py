@@ -3,6 +3,7 @@ import logging
 
 from .pytorch_converter import PyTorchConverter
 from .text_converter import TextConverter
+from .llm_converter import LLMConverter
 
 
 def setup_logging(log_filename: str) -> None:
@@ -29,11 +30,15 @@ def convert_text(args: argparse.Namespace) -> None:
     converter = TextConverter(args.input, args.output, args.num_npus, args.num_passes)
     converter.convert()
 
-
 def convert_pytorch(args: argparse.Namespace) -> None:
     """Convert PyTorch input trace to Chakra execution trace."""
     converter = PyTorchConverter()
     converter.convert(args.input, args.output, args.simulate)
+
+def convert_llm(args: argparse.Namespace) -> None:
+    """Convert llm text input trace to Chakra execution trace."""
+    converter = LLMConverter(args.input, args.output, args.num_npus)
+    converter.convert()
 
 
 def main() -> None:
@@ -106,12 +111,36 @@ def main() -> None:
     )
     text_parser.set_defaults(func=convert_text)
 
+    llm_parser = subparsers.add_parser(
+        "LLM", help="Convert text-based llm model description to Chakra schema-based traces in the protobuf format"
+    )
+    llm_parser.add_argument(
+        "--input",
+        type=str,
+        required=True,
+        help=(
+            "Input file in the text format that describes a model. This follows the text format used in ASTRA-sim: "
+            "https://github.com/astra-sim/astra-sim"
+        ),
+    )
+    llm_parser.add_argument(
+        "--output", type=str, required=True, help="Output Chakra execution trace filename in the protobuf format"
+    )
+    llm_parser.add_argument(
+        "--num-npus",
+        type=int,
+        required=True,
+        help="Number of NPUs in a system. Determines the number of traces the converter generates",
+    )
+
+    llm_parser.set_defaults(func=convert_llm)
+
     args = parser.parse_args()
 
     if "func" in args:
         setup_logging(args.log_filename)
         args.func(args)
-        logging.info(f"Conversion successful. Output file is available at {args.output}.")
+        # logging.info(f"Conversion successful. Output file is available at {args.output}.")
     else:
         parser.print_help()
 

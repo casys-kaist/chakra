@@ -174,3 +174,10 @@ void ETFeeder::readNextWindow() {
     }
   }
 }
+
+void ETFeeder::printGraph() {
+  for (auto const &pair: dep_graph_) {
+      cout << "{" << pair.first << ": ";
+      pair.second->printNode();
+  }
+}

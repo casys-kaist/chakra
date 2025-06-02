@@ -37,13 +37,14 @@ class ETFeeder {
   std::shared_ptr<ETFeederNode> readNode();
   void readNextWindow();
   void resolveDep();
+  void printGraph();
 
  private:
   ProtoInputStream trace_;
   const uint32_t window_size_;
   bool et_complete_;
 
-  std::unordered_map<uint64_t, std::shared_ptr<ETFeederNode>> dep_graph_{};
+  std::map<uint64_t, std::shared_ptr<ETFeederNode>> dep_graph_{};
   std::unordered_set<uint64_t> dep_free_node_id_set_{};
   std::priority_queue<
       std::shared_ptr<ETFeederNode>,

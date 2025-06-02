@@ -45,6 +45,7 @@ class ETFeederNode {
   std::string get_outputs_values() const;
   std::string get_outputs_shapes() const;
   std::string get_outputs_types() const;
+  void printNode();
 
  private:
   void assign_attr_val(
