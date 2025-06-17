@@ -499,6 +499,7 @@ class LLMConverter:
             for npu_offset in range(npus_per_group):
                 npu_id = npu_group * npus_per_group + npu_offset
                 output_filename = "%s.%d.et" % (self.output_filename, npu_id)
+                first_comp_node = True
                 with open(output_filename, "wb") as g:
                     global_metadata = self.get_global_metadata()
                     encode_message(g, global_metadata)
@@ -557,7 +558,7 @@ class LLMConverter:
                                     layers[layer_num].comp_time // npus_comp)
                                 layers[layer_num].comp_node = comp_node
 
-                                if layer_num == layer_start or (layer_num == layer_start+1 and layers[layer_start].is_attn) :
+                                if first_comp_node:
                                     if npu_group == 0:
                                         self.add_parent(comp_node, input_load_node)
                                     else:
@@ -566,6 +567,7 @@ class LLMConverter:
                                         self.add_parent(comp_node, evict)
                                     if load != None:
                                         self.add_parent(comp_node, load)
+                                    first_comp_node = False
                                 else:
                                     if layers[layer_num - 1].comm_node != None:
                                         self.add_parent(comp_node, layers[layer_num - 1].comm_node)
@@ -707,6 +709,7 @@ class LLMConverter:
             for npu_offset in range(npus_per_group):
                 npu_id = npu_group * npus_per_group + npu_offset
                 output_filename = "%s.%d.et" % (self.output_filename, npu_id)
+                first_comp_node = True
                 with open(output_filename, "wb") as g:
                     global_metadata = self.get_global_metadata()
                     encode_message(g, global_metadata)
@@ -804,7 +807,7 @@ class LLMConverter:
                                         layers[layer_num].comp_time // npus_comp)
                                     layers[layer_num].comp_node = comp_node
 
-                                    if layer_num == layer_start or (layer_num == layer_start+1 and layers[layer_start].is_attn) :
+                                    if first_comp_node:
                                         if npu_group == 0:
                                             self.add_parent(comp_node, input_load_node)
                                         else:
@@ -813,6 +816,7 @@ class LLMConverter:
                                             self.add_parent(comp_node, evict)
                                         if load != None:
                                             self.add_parent(comp_node, load)
+                                        first_comp_node = False
                                     else:
                                         if layers[layer_num - 1].comm_node != None:
                                             self.add_parent(comp_node, layers[layer_num - 1].comm_node)
