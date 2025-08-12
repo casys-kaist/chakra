@@ -63,10 +63,12 @@ class LLMConverter:
         input_filename: str,
         output_filename: str,
         num_npus: int,
+        npu_offset: int = 0
     ):
         self.input_filename = input_filename
         self.output_filename = output_filename
         self.num_npus = num_npus
+        self.npu_offset = npu_offset
         self.next_node_id = 0
 
         # For send & recv nodes
@@ -497,7 +499,7 @@ class LLMConverter:
             if layer_end >= num_layers:
                 layer_end = num_layers
             for npu_offset in range(npus_per_group):
-                npu_id = npu_group * npus_per_group + npu_offset
+                npu_id = npu_group * npus_per_group + npu_offset + self.npu_offset
                 output_filename = "%s.%d.et" % (self.output_filename, npu_id)
                 first_comp_node = True
                 with open(output_filename, "wb") as g:

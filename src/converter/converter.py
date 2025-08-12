@@ -37,7 +37,7 @@ def convert_pytorch(args: argparse.Namespace) -> None:
 
 def convert_llm(args: argparse.Namespace) -> None:
     """Convert llm text input trace to Chakra execution trace."""
-    converter = LLMConverter(args.input, args.output, args.num_npus)
+    converter = LLMConverter(args.input, args.output, args.num_npus, args.npu_offset)
     converter.convert()
 
 
@@ -131,6 +131,13 @@ def main() -> None:
         type=int,
         required=True,
         help="Number of NPUs in a system. Determines the number of traces the converter generates",
+    )
+
+    llm_parser.add_argument(
+        "--npu-offset",
+        type=int,
+        default=0,
+        help="NPU offset to convert multiple instances of the same model. Default is 0, which means no offset.",
     )
 
     llm_parser.set_defaults(func=convert_llm)
