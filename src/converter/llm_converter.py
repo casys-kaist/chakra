@@ -182,277 +182,7 @@ class LLMConverter:
     def add_parent(self, child_node: Any, parent_node: Any) -> None:
         child_node.data_deps.append(parent_node.id)
 
-    def convert_tensor_parallel(self, f: TextIOWrapper, num_layers: int):
-        layers: list[Layer] = self.get_layers(f)
-        for npu_id in range(self.num_npus):
-            output_filename = "%s.%d.et" % (self.output_filename, npu_id)
-            has_load_kv = False
-            with open(output_filename, "wb") as g:
-                global_metadata = self.get_global_metadata()
-                encode_message(g, global_metadata)
-                for idx, layer in enumerate(layers):
-                    # Load input (for the first layer)
-                    if idx == 0:
-                        input_load_node = self.get_memory_load_node(
-                            layer.name,
-                            "INPUT",
-                            layer.input_memory_loc,
-                            layer.input_memory_size // self.num_npus,
-                        )
-                        layer.input_memory_node = input_load_node
-                        encode_message(g, input_load_node)
-
-                    # Compute
-                    if layer.comp_time != 0:
-                        comp_node = self.get_comp_node(
-                        layer.name, 
-                        layer.comp_time // self.num_npu)
-                        layer.comp_node = comp_node
-                        if idx == 0:
-                            self.add_parent(comp_node, input_load_node)
-                        elif layers[idx - 1].comm_node != None:
-                            self.add_parent(comp_node, layers[idx - 1].comm_node)
-                        elif layers[idx - 1].comp_node != None:
-                            self.add_parent(comp_node, layers[idx - 1].comp_node)
-                        else:
-                            self.add_parent(comp_node, layers[idx - 2].comp_node)
-                        encode_message(g, comp_node)
-
-                    # Communication (if required)
-                    if layer.comm_type != "NONE":
-                        comm_coll_node = self.get_comm_coll_node(layer.name, layer.comm_type, layer.comm_size // self.num_npus)
-                        # for j in range(self.num_dims): # dims should be 1
-                        # comm_coll_node.involved_dim.append(True)
-                        layer.comm_node = comm_coll_node
-                        if layer.comp_time != 0:
-                            self.add_parent(comm_coll_node, comp_node)
-                        encode_message(g, comm_coll_node)
-
-                    # Store output
-                    if idx == (len(layers) - 1):
-                        output_store_node = self.get_memory_store_node(
-                            layer.name,
-                            "OUTPUT",
-                            layer.output_memory_loc,
-                            layer.output_memory_size // self.num_npus
-                        )
-                        layer.output_memory_node = output_store_node
-                        if layer.comm_type != "NONE":
-                            self.add_parent(output_store_node, comm_coll_node)
-                        elif layer.comp_time != 0:
-                            self.add_parent(output_store_node, comp_node)
-                        else:
-                            self.add_parent(output_store_node, layers[idx-1].comp_node)
-                        encode_message(g, output_store_node)
-
-    def convert_pipeline_parallel(self, f: TextIOWrapper, num_layers: int):
-        layers: list[Layer] = self.get_layers(f)
-
-        if num_layers < self.num_npus: print("Warning! num_layers < self.num_npus, Some npus won't do anything!")
-        layers_per_npu = num_layers // self.num_npus
-        remain_layers = num_layers % self.num_npus
-        current_layer_num = 0
-        current_layer = None
-
-        for npu_id in range(self.num_npus):
-            output_filename = "%s.%d.et" % (self.output_filename, npu_id)
-            with open(output_filename, "wb") as g:
-                global_metadata = self.get_global_metadata()
-                encode_message(g, global_metadata)
-                # Load input (for the first layer)
-                if current_layer_num == 0:
-                    input_load_node = self.get_memory_load_node(
-                        layers[current_layer_num].name,
-                        "INPUT",
-                        layers[current_layer_num].input_memory_loc,
-                        layers[current_layer_num].input_memory_size,
-                    )
-                    layers[current_layer_num].input_memory_node = input_load_node
-                    encode_message(g, input_load_node)
-                # Receive input (from the previous layer in another npu)
-                else:
-                    receive_input_node = self.get_comm_node(
-                        is_send=False,
-                        layer_name=layers[current_layer_num].name,
-                        comm_type=layers[current_layer_num].comm_type,
-                        comm_size=layers[current_layer_num].input_memory_size,
-                        comm_src=npu_id-1,
-                        comm_dst=npu_id
-                    )
-                    layers[current_layer_num].comm_node = receive_input_node
-                    encode_message(g, receive_input_node)
-
-                starting_layer = current_layer_num
-                for i in range(layers_per_npu + (1 if remain_layers > 0 else 0)):
-
-                    # Compute
-                    if layers[current_layer_num].comp_time != 0:
-                        comp_node = self.get_comp_node(
-                        layers[current_layer_num].name,
-                        layers[current_layer_num].comp_time)
-
-                        layers[current_layer_num].comp_node = comp_node
-                        if current_layer_num == 0:
-                            self.add_parent(comp_node, input_load_node)
-                        else:
-                            if i == 0:
-                                self.add_parent(comp_node, receive_input_node)
-                            else:
-                                if layers[current_layer_num - 1].comp_node != None:
-                                    self.add_parent(comp_node, layers[current_layer_num - 1].comp_node)
-                                else: # if latest layer is kv cache
-                                    self.add_parent(comp_node, layers[current_layer_num - 2].comp_node)
-                        encode_message(g, comp_node)
-
-                    current_layer_num += 1
-
-                if remain_layers > 0:
-                    remain_layers -= 1
-                
-                current_layer_num -= 1
-                if current_layer_num == (len(layers) - 1):
-                    # Store output (for the last layer)
-                    output_store_node = self.get_memory_store_node(
-                        layers[current_layer_num].name,
-                        "OUTPUT",
-                        layers[current_layer_num].output_memory_loc,
-                        layers[current_layer_num].output_memory_size
-                    )
-                    layers[current_layer_num].output_memory_node = output_store_node
-                    if layers[current_layer_num].comp_node != None:
-                        self.add_parent(output_store_node, comp_node)
-                    else:
-                        self.add_parent(output_store_node, layers[current_layer_num-1].comp_node)
-                    encode_message(g, output_store_node)
-                    return
-                else:
-                    # Send output (to the next layer in another npu)
-                    send_output_node = self.get_comm_node(
-                        is_send=True,
-                        layer_name=layers[current_layer_num].name,
-                        comm_type=layers[current_layer_num].comm_type,
-                        comm_size=layers[current_layer_num].output_memory_size,
-                        comm_src=npu_id,
-                        comm_dst=npu_id+1
-                    )
-                    layers[current_layer_num].comm_node = send_output_node
-                    if layers[current_layer_num].comp_node != None:
-                        self.add_parent(send_output_node, comp_node)
-                    else:
-                        self.add_parent(send_output_node, layers[current_layer_num-1].comp_node)
-                    encode_message(g, send_output_node)
-                current_layer_num += 1
-
-    def convert_hybrid_tensor_pipeline(self, f: TextIOWrapper, num_layers: int, num_npu_group: int):
-        layers: list[Layer] = self.get_layers(f)
-
-        if self.num_npus % num_npu_group != 0: print("Warning! num_npus % num_npu_group != 0, Some npus won't do anything!")
-        npus_per_group = self.num_npus // num_npu_group
-        layers_per_group = num_layers // num_npu_group
-        remain_layers = num_layers % num_npu_group
-
-        layer_start = 0
-        layer_end = 0
-        for npu_group in range(num_npu_group):
-            layer_start = layer_end
-            layer_end = layer_start + layers_per_group + (1 if remain_layers > 0 else 0)
-            for npu_offset in range(npus_per_group):
-                npu_id = npu_group * npus_per_group + npu_offset
-                output_filename = "%s.%d.et" % (self.output_filename, npu_id)
-                with open(output_filename, "wb") as g:
-                    global_metadata = self.get_global_metadata()
-                    encode_message(g, global_metadata)
-                    if npu_group == 0:
-                        # Load Input
-                        input_load_node = self.get_memory_load_node(
-                            layers[layer_start].name,
-                            "INPUT",
-                            layers[layer_start].input_memory_loc,
-                            layers[layer_start].input_memory_size // npus_per_group,
-                        )
-                        encode_message(g, input_load_node)
-                    else:
-                        # Receive input (from the previous layer in another npu group)
-                        receive_input_node = self.get_comm_node(
-                            is_send=False,
-                            layer_name=layers[layer_start].name,
-                            comm_type=layers[layer_start].comm_type,
-                            comm_size=layers[layer_start].input_memory_size // npus_per_group,
-                            comm_src=npu_id - npus_per_group,
-                            comm_dst=npu_id
-                        )
-                        encode_message(g, receive_input_node)
-
-                    for layer_num in range(layer_start, layer_end):
-
-                        # Compute
-                        if layers[layer_num].comp_time != 0:
-                            comp_node = self.get_comp_node(
-                                layers[layer_num].name, 
-                                layers[layer_num].comp_time // npus_per_group)
-                            layers[layer_num].comp_node = comp_node
-                            if layer_num == layer_start:
-                                if npu_group == 0:
-                                    self.add_parent(comp_node, input_load_node)
-                                else:
-                                    self.add_parent(comp_node, receive_input_node)
-                            else:
-                                if layers[layer_num - 1].comm_node != None:
-                                    self.add_parent(comp_node, layers[layer_num - 1].comm_node)
-                                elif layers[layer_num - 1].comp_node != None:
-                                    self.add_parent(comp_node, layers[layer_num - 1].comp_node)
-                                else:
-                                    self.add_parent(comp_node, layers[layer_num - 2].comp_node)
-                            
-                            encode_message(g, comp_node)
-
-                        # Communication (if required)
-                        if layers[layer_num].comm_type != "NONE":
-                            comm_coll_node = self.get_comm_coll_node(layers[layer_num].name, layers[layer_num].comm_type, layers[layer_num].comm_size // npus_per_group)
-                            # for j in range(self.num_dims): # 1
-                            # comm_coll_node.involved_dim.append(True)
-                            layers[layer_num].comm_node = comm_coll_node
-                            if layers[layer_num].comp_time != 0:
-                                self.add_parent(comm_coll_node, comp_node)
-                            encode_message(g, comm_coll_node)
-
-                    
-                    if npu_group == (num_npu_group - 1):
-                        # Store output (for the last layer)
-                        output_store_node = self.get_memory_store_node(
-                            layers[layer_end - 1].name,
-                            "OUTPUT",
-                            layers[layer_end - 1].output_memory_loc,
-                            layers[layer_end - 1].output_memory_size // npus_per_group
-                        )
-                        if layers[layer_end - 1].comm_type != "NONE":
-                            self.add_parent(output_store_node, comm_coll_node)
-                        elif layers[layer_end - 1].comp_node != None:
-                            self.add_parent(output_store_node, layers[layer_end - 1].comp_node)
-                        else:
-                            self.add_parent(output_store_node, layers[layer_end - 2].comp_node)
-                        encode_message(g, output_store_node)
-                    else:
-                        # Send output (to the next layer in another npu group)
-                        send_output_node = self.get_comm_node(
-                            is_send=True,
-                            layer_name=layers[layer_end - 1].name,
-                            comm_type=layers[layer_end - 1].comm_type,
-                            comm_size=layers[layer_end - 1].output_memory_size // npus_per_group,
-                            comm_src=npu_id,
-                            comm_dst=npu_id + npus_per_group
-                        )
-                        if layers[layer_end - 1].comm_type != "NONE":
-                            self.add_parent(send_output_node, comm_coll_node)
-                        elif layers[layer_end - 1].comp_node != None:
-                            self.add_parent(send_output_node, comp_node)
-                        else:
-                            self.add_parent(send_output_node, layers[layer_end - 2].comp_node)
-                        encode_message(g, send_output_node)
-            remain_layers -= 1
-
-
-    def convert_orca(self, f: TextIOWrapper, num_layers: int, num_npu_group: int):
+    def convert_common(self, f: TextIOWrapper, num_layers: int, num_npu_group: int):
         layers: list[Layer] = self.get_layers(f)
 
         # vllm: check eviction or load
@@ -460,14 +190,14 @@ class LLMConverter:
         load = None
         ev_ld_cnt = 0
         for i in range(2):
-            if 'vllm_load' in layers[i].name:
+            if 'kv_load' in layers[i].name:
                 load = self.get_memory_load_node(
                             layers[i].name,
                             "WEIGHT",
                             layers[i].weight_memory_loc,
                             layers[i].weight_memory_size, # already per npu kv_cache size
                         )
-            elif 'vllm_evict' in layers[i].name:
+            elif 'kv_evict' in layers[i].name:
                 evict = self.get_memory_store_node(
                             layers[i].name,
                             "WEIGHT",
@@ -657,6 +387,251 @@ class LLMConverter:
                             self.add_parent(send_output_node, layers[layer_end - 2].comp_node)
                         encode_message(g, send_output_node)
             remain_layers -= 1
+    
+    def convert_prefill(self, f: TextIOWrapper, num_layers: int, num_npu_group: int):
+        layers: list[Layer] = self.get_layers(f)
+
+        # vllm: check eviction or load
+        evict = None
+        load = None
+        ev_ld_cnt = 0
+        for i in range(2):
+            if 'kv_load' in layers[i].name:
+                load = self.get_memory_load_node(
+                            layers[i].name,
+                            "WEIGHT",
+                            layers[i].weight_memory_loc,
+                            layers[i].weight_memory_size, # already per npu kv_cache size
+                        )
+            elif 'kv_evict' in layers[i].name:
+                evict = self.get_memory_store_node(
+                            layers[i].name,
+                            "WEIGHT",
+                            layers[i].weight_memory_loc,
+                            layers[i].weight_memory_size,
+                        )
+            else:
+                continue
+            ev_ld_cnt += 1
+            
+        layers = layers[ev_ld_cnt:]
+        num_layers -= ev_ld_cnt
+
+        if self.num_npus % num_npu_group != 0: print("Warning! num_npus % num_npu_group != 0, Some npus won't do anything!")
+        npus_per_group = self.num_npus // num_npu_group
+        if npus_per_group == 1: # same as pipeline parallelism, ignore all reduce
+            use_comm = False
+        else:
+            use_comm = True
+        layers_per_group = num_layers // num_npu_group
+        remain_layers = num_layers % num_npu_group
+
+        layer_start = 0
+        layer_end = 0
+
+        for npu_group in range(num_npu_group):
+            layer_start = layer_end
+            layer_end = layer_start + layers_per_group + (1 if remain_layers > 0 else 0)
+            if layer_end >= num_layers:
+                layer_end = num_layers
+            for npu_offset in range(npus_per_group):
+                npu_id = npu_group * npus_per_group + npu_offset + self.npu_offset
+                output_filename1 = "%s.%d.et" % (self.output_filename, npu_id)
+                output_filename2 = "%s.%d.et" % (self.output_filename, npu_id + self.num_npus) # sender for prefill-decode
+                first_comp_node = True
+                with open(output_filename1, "wb") as g, open(output_filename2, "wb") as s:
+                    global_metadata = self.get_global_metadata()
+                    encode_message(g, global_metadata)
+                    encode_message(s, global_metadata)
+                    if evict != None:
+                        encode_message(g, evict)
+                    if load != None:
+                        encode_message(g, load)
+                    if npu_group == 0:
+                        # Load Input
+                        input_load_node = self.get_memory_load_node(
+                            layers[layer_start].name,
+                            "INPUT",
+                            layers[layer_start].input_memory_loc,
+                            layers[layer_start].input_memory_size // npus_per_group,
+                        )
+                        encode_message(g, input_load_node)                  
+                    else:
+                        if layers[layer_start].is_attn == True:
+                            # Receive input (from the previous layer in another npu group)
+                            receive_input_node = self.get_comm_node(
+                                is_send=False,
+                                layer_name=layers[layer_start-1].name,
+                                comm_type=layers[layer_start-1].comm_type,
+                                comm_size=layers[layer_start-1].output_memory_size // npus_per_group,
+                                comm_src=npu_id - npus_per_group,
+                                comm_dst=npu_id
+                            )
+                            encode_message(g, receive_input_node)
+                        else:
+                            # Receive input (from the previous layer in another npu group)
+                            receive_input_node = self.get_comm_node(
+                                is_send=False,
+                                layer_name=layers[layer_start].name,
+                                comm_type=layers[layer_start].comm_type,
+                                comm_size=layers[layer_start].input_memory_size // npus_per_group,
+                                comm_src=npu_id - npus_per_group,
+                                comm_dst=npu_id
+                            )
+                            encode_message(g, receive_input_node)
+
+                    attn_start = False
+                    layer_num = layer_start
+                    while attn_start or layer_num < layer_end:
+                        if attn_start:
+                            # attention has no memory need to consider only input, output
+                            # each attention is loaded in a NPU so the npus_per_group should be 1
+                            npus_comp = 1
+                        else:
+                            npus_comp = npus_per_group
+                        # check attention layer
+                        if layers[layer_num].is_attn == False:
+                            # Compute
+                            if layers[layer_num].comp_time != 0:
+                                comp_node = self.get_comp_node(
+                                    layers[layer_num].name, 
+                                    layers[layer_num].comp_time // npus_comp)
+                                layers[layer_num].comp_node = comp_node
+
+                                if first_comp_node:
+                                    if npu_group == 0:
+                                        self.add_parent(comp_node, input_load_node)
+                                    else:
+                                        self.add_parent(comp_node, receive_input_node)
+                                    if evict != None:
+                                        self.add_parent(comp_node, evict)
+                                    if load != None:
+                                        self.add_parent(comp_node, load)
+                                    first_comp_node = False
+                                else:
+                                    if layers[layer_num - 1].comm_node != None:
+                                        self.add_parent(comp_node, layers[layer_num - 1].comm_node)
+                                    elif layers[layer_num - 1].comp_node != None:
+                                        self.add_parent(comp_node, layers[layer_num - 1].comp_node)
+                                    else:
+                                        self.add_parent(comp_node, layers[layer_num - 2].comp_node)
+                                
+                                encode_message(g, comp_node)
+
+                                # Send KV cache after each kv_proj
+                                if "v_proj" in layers[layer_num].name:
+                                    send_kv_node = self.get_comm_node(
+                                        is_send=True,
+                                        layer_name="kv_proj",
+                                        comm_type=layers[layer_num].comm_type,
+                                        comm_size=layers[layer_num].output_memory_size // npus_per_group * 2,
+                                        comm_src=npu_id,
+                                        comm_dst=npu_id + self.num_npus, # to the paired npu in decode
+                                        id=layer_num
+                                    )
+                                    self.add_parent(send_kv_node, comp_node)
+                                    encode_message(g, send_kv_node)
+
+                                    recv_kv_node = self.get_comm_node(
+                                        is_send=False,
+                                        layer_name="kv_proj",
+                                        comm_type=layers[layer_num].comm_type,
+                                        comm_size=layers[layer_num].output_memory_size // npus_per_group * 2,
+                                        comm_src=npu_id,
+                                        comm_dst=npu_id + self.num_npus,
+                                        id=layer_num
+                                    )
+                                    encode_message(s, recv_kv_node)
+
+                            # Communication (if required)
+                            if layers[layer_num].comm_type != "NONE" and use_comm:
+                                comm_coll_node = self.get_comm_coll_node(layers[layer_num].name, layers[layer_num].comm_type, layers[layer_num].comm_size // npus_per_group)
+                                # for j in range(self.num_dims):
+                                # comm_coll_node.involved_dim.append(True)
+                                layers[layer_num].comm_node = comm_coll_node
+                                if layers[layer_num].comp_time != 0:
+                                    self.add_parent(comm_coll_node, comp_node)
+                                encode_message(g, comm_coll_node)
+                            # add layer_num
+                            layer_num += 1
+                        # attention layer starts
+                        else:
+                            attn_start = True
+                            # check attention end
+                            if layers[layer_num].attn_num == 'END':
+                                attn_start = False
+                                layers[layer_num].comp_node = comp_node # is latest comp_node
+                                layer_num += 1
+                                continue
+                            attn_id = int(layers[layer_num].attn_num) % npus_per_group
+                            if npu_offset != attn_id:
+                                # go to next attention
+                                while True:
+                                    layer_num += 1
+                                    if layers[layer_num].is_attn:
+                                        break
+                            else:
+                                layers[layer_num].comp_node = comp_node # is latest comp_node
+                                layer_num += 1
+
+                    # update new layer_end
+                    layer_end = layer_num
+
+                    if npu_group == (num_npu_group - 1):
+                        # Send output (for the last layer, to the paired decode npu)
+                        send_output_node = self.get_comm_node(
+                            is_send=True,
+                            layer_name=layers[layer_end - 1].name,
+                            comm_type=layers[layer_end - 1].comm_type,
+                            comm_size=layers[layer_end - 1].output_memory_size // npus_per_group,
+                            comm_src=npu_id,
+                            comm_dst=npu_id + self.num_npus
+                        )
+                        if layers[layer_end - 1].comm_type != "NONE" and use_comm:
+                            self.add_parent(send_output_node, comm_coll_node)
+                        elif layers[layer_end - 1].comp_node != None:
+                            self.add_parent(send_output_node, comp_node)
+                        else:
+                            self.add_parent(send_output_node, layers[layer_end - 2].comp_node)
+                        encode_message(g, send_output_node)
+                        # paired decode npu receive output
+                        recv_output_node = self.get_comm_node(
+                            is_send=False,
+                            layer_name=layers[layer_end - 1].name,
+                            comm_type=layers[layer_end - 1].comm_type,
+                            comm_size=layers[layer_end - 1].output_memory_size // npus_per_group,
+                            comm_src=npu_id,
+                            comm_dst=npu_id + self.num_npus
+                        )
+                        encode_message(s, recv_output_node)
+                    else:
+                        if layers[layer_end - 1].is_attn == True:
+                            # Send output (to the next layer in another npu group)
+                            send_output_node = self.get_comm_node(
+                                is_send=True,
+                                layer_name=layers[layer_end].name,
+                                comm_type=layers[layer_end].comm_type,
+                                comm_size=layers[layer_end].input_memory_size // npus_per_group,
+                                comm_src=npu_id,
+                                comm_dst=npu_id + npus_per_group
+                            )
+                        else:
+                            send_output_node = self.get_comm_node(
+                                is_send=True,
+                                layer_name=layers[layer_end - 1].name,
+                                comm_type=layers[layer_end - 1].comm_type,
+                                comm_size=layers[layer_end - 1].output_memory_size // npus_per_group,
+                                comm_src=npu_id,
+                                comm_dst=npu_id + npus_per_group
+                            )
+                        if layers[layer_end - 1].comm_type != "NONE" and use_comm:
+                            self.add_parent(send_output_node, comm_coll_node)
+                        elif layers[layer_end - 1].comp_node != None:
+                            self.add_parent(send_output_node, comp_node)
+                        else:
+                            self.add_parent(send_output_node, layers[layer_end - 2].comp_node)
+                        encode_message(g, send_output_node)
+            remain_layers -= 1
 
     def convert_pim(self, f: TextIOWrapper, num_layers: int, num_npu_group: int):
         layers: list[Layer] = self.get_layers(f)
@@ -666,14 +641,14 @@ class LLMConverter:
         load = None
         ev_ld_cnt = 0
         for i in range(2):
-            if 'vllm_load' in layers[i].name:
+            if 'kv_load' in layers[i].name:
                 load = self.get_memory_load_node(
                             layers[i].name,
                             "WEIGHT",
                             layers[i].weight_memory_loc,
                             layers[i].weight_memory_size, # already per npu kv_cache size
                         )
-            elif 'vllm_evict' in layers[i].name:
+            elif 'kv_evict' in layers[i].name:
                 evict = self.get_memory_store_node(
                             layers[i].name,
                             "WEIGHT",
@@ -1027,7 +1002,7 @@ class LLMConverter:
     def convert(self):
         with open(self.input_filename, "r") as f:
             first_line = f.readline().strip().split()
-            parallelism_type = first_line[0]
+            execution_type = first_line[0]
 
             if len(first_line) == 3:
                 assert(first_line[1] == "model_parallel_NPU_group:")
@@ -1040,23 +1015,23 @@ class LLMConverter:
 
             third_line = f.readline() # This is for the table header, so just ignore it
 
-            if parallelism_type == "TENSOR":
-                self.convert_tensor_parallel(f, num_layers)
-            elif parallelism_type == "PIPELINE":
-                self.convert_pipeline_parallel(f, num_layers)
-            elif parallelism_type == "HYBRID_TENSOR_PIPELINE":
+            if execution_type == "COLOCATED":
                 if num_npu_group <= 0:
                     raise ValueError(f"model_parallel_NPU_group <= 0")
-                self.convert_hybrid_tensor_pipeline(f, num_layers, num_npu_group)
-            elif parallelism_type == "ORCA":
+                self.convert_common(f, num_layers, num_npu_group)
+            elif execution_type == "PREFILL":
                 if num_npu_group <= 0:
                     raise ValueError(f"model_parallel_NPU_group <= 0")
-                self.convert_orca(f, num_layers, num_npu_group)
-            elif parallelism_type == "PIM_POOL":
+                self.convert_prefill(f, num_layers, num_npu_group)
+            elif execution_type == "DECODE":
+                if num_npu_group <= 0:
+                    raise ValueError(f"model_parallel_NPU_group <= 0")
+                self.convert_common(f, num_layers, num_npu_group)
+            elif execution_type == "PIM_POOL":
                 if num_npu_group <= 0:
                     raise ValueError(f"model_parallel_NPU_group <= 0")
                 self.convert_pim(f, num_layers, num_npu_group)
-            elif parallelism_type == "EVENT":
+            elif execution_type == "EVENT":
                 self.convert_event(f, num_layers)
             else:
-                raise ValueError(f"Unsupported parallelism type, {parallelism_type}")
+                raise ValueError(f"Unsupported execution type, {execution_type}")
