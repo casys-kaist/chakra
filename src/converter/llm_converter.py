@@ -26,11 +26,21 @@ class Layer:
                 self.name = col[0]
                 self.attn_num = col[1]
                 self.is_attn = True
+                self.is_expert = False
                 self.comm_node = None
                 self.comp_node = None
                 self.comm_type = "NONE"
+            elif col[0] == 'EXPERT': # If Expert Flag
+                self.name = col[0]
+                self.expert_num = col[1]
+                self.is_attn = False
+                self.is_expert = True
+                self.comm_node = None
+                self.comp_node = None
+                self.comm_type = "ALLTOALL"
             else:
                 self.is_attn = False
+                self.is_expert = False
                 self.name = col[0]
 
                 # compuation
@@ -63,12 +73,14 @@ class LLMConverter:
         input_filename: str,
         output_filename: str,
         num_npus: int,
-        npu_offset: int = 0
+        npu_offset: int = 0,
+        expert_offloading: bool = False,
     ):
         self.input_filename = input_filename
         self.output_filename = output_filename
         self.num_npus = num_npus
         self.npu_offset = npu_offset
+        self.expert_offloading = expert_offloading
         self.next_node_id = 0
 
         # For send & recv nodes
@@ -249,7 +261,7 @@ class LLMConverter:
                         )
                         encode_message(g, input_load_node)                  
                     else:
-                        if layers[layer_start].is_attn == True:
+                        if layers[layer_start].is_attn == True or layers[layer_start].is_expert == True:
                             # Receive input (from the previous layer in another npu group)
                             receive_input_node = self.get_comm_node(
                                 is_send=False,
@@ -273,16 +285,28 @@ class LLMConverter:
                             encode_message(g, receive_input_node)
 
                     attn_start = False
+                    expert_start = False
                     layer_num = layer_start
-                    while attn_start or layer_num < layer_end:
-                        if attn_start:
+                    while attn_start or expert_start or layer_num < layer_end:
+                        if attn_start or expert_start:
                             # attention has no memory need to consider only input, output
-                            # each attention is loaded in a NPU so the npus_per_group should be 1
+                            # each attention/expert is loaded in a NPU so the npus_per_group should be 1
                             npus_comp = 1
                         else:
                             npus_comp = npus_per_group
                         # check attention layer
-                        if layers[layer_num].is_attn == False:
+                        if layers[layer_num].is_attn == False and layers[layer_num].is_expert == False:
+                            if expert_start == True and self.expert_offloading == True and layers[layer_num].weight_memory_size > 0:
+                                # Load expert weight (for expert layers in expert offloading)
+                                expert_weight_load_node = self.get_memory_load_node(
+                                    layers[layer_num].name,
+                                    "WEIGHT",
+                                    layers[layer_num].weight_memory_loc,
+                                    layers[layer_num].weight_memory_size // npus_per_group,
+                                )
+                                layers[layer_num].weight_memory_node = expert_weight_load_node
+                                encode_message(g, expert_weight_load_node)
+                                self.add_parent(expert_weight_load_node, comp_node) # dependent to previous comp_node due to gate function
                             # Compute
                             if layers[layer_num].comp_time != 0:
                                 comp_node = self.get_comp_node(
@@ -299,8 +323,12 @@ class LLMConverter:
                                         self.add_parent(comp_node, evict)
                                     if load != None:
                                         self.add_parent(comp_node, load)
+                                    if layers[layer_num].weight_memory_node != None:
+                                        self.add_parent(comp_node, layers[layer_num].weight_memory_node)
                                     first_comp_node = False
                                 else:
+                                    if layers[layer_num].weight_memory_node != None:
+                                        self.add_parent(comp_node, layers[layer_num].weight_memory_node)
                                     if layers[layer_num - 1].comm_node != None:
                                         self.add_parent(comp_node, layers[layer_num - 1].comm_node)
                                     elif layers[layer_num - 1].comp_node != None:
@@ -322,7 +350,7 @@ class LLMConverter:
                             # add layer_num
                             layer_num += 1
                         # attention layer starts
-                        else:
+                        elif layers[layer_num].is_attn == True:
                             attn_start = True
                             # check attention end
                             if layers[layer_num].attn_num == 'END':
@@ -330,12 +358,45 @@ class LLMConverter:
                                 layers[layer_num].comp_node = comp_node # is latest comp_node
                                 layer_num += 1
                                 continue
+                            # round robin assignment
                             attn_id = int(layers[layer_num].attn_num) % npus_per_group
                             if npu_offset != attn_id:
                                 # go to next attention
                                 while True:
                                     layer_num += 1
                                     if layers[layer_num].is_attn:
+                                        break
+                            else:
+                                layers[layer_num].comp_node = comp_node # is latest comp_node
+                                layer_num += 1
+                        # expert layer starts
+                        elif layers[layer_num].is_expert == True:
+                            if expert_start == False and use_comm:
+                                # Start of expert, add ALLTOALL communication before expert computation
+                                comm_coll_node = self.get_comm_coll_node("expert_start", layers[layer_num].comm_type, layers[layer_num-1].output_memory_size // npus_per_group)
+                                layers[layer_num].comm_node = comm_coll_node
+                                self.add_parent(comm_coll_node, comp_node)
+                                encode_message(g, comm_coll_node)
+                            expert_start = True
+                            # check expert end
+                            if layers[layer_num].expert_num == 'END':
+                                expert_start = False
+                                layers[layer_num].comp_node = comp_node # is latest comp_node
+                                layer_num += 1
+                                # End of expert, add ALLTOALL communication after expert computation
+                                if use_comm:
+                                    comm_coll_node = self.get_comm_coll_node("expert_end", layers[layer_num].comm_type, layers[layer_num+1].input_memory_size // npus_per_group)
+                                    layers[layer_num].comm_node = comm_coll_node
+                                    self.add_parent(comm_coll_node, comp_node)
+                                    encode_message(g, comm_coll_node)
+                                continue
+                            # round robin assignment
+                            expert_id = int(layers[layer_num].expert_num) % npus_per_group
+                            if npu_offset != expert_id:
+                                # go to next expert
+                                while True:
+                                    layer_num += 1
+                                    if layers[layer_num].is_expert:
                                         break
                             else:
                                 layers[layer_num].comp_node = comp_node # is latest comp_node
@@ -360,7 +421,7 @@ class LLMConverter:
                             self.add_parent(output_store_node, layers[layer_end - 2].comp_node)
                         encode_message(g, output_store_node)
                     else:
-                        if layers[layer_end - 1].is_attn == True:
+                        if layers[layer_end - 1].is_attn == True or layers[layer_end - 1].is_expert == True:
                             # Send output (to the next layer in another npu group)
                             send_output_node = self.get_comm_node(
                                 is_send=True,
@@ -457,7 +518,7 @@ class LLMConverter:
                         )
                         encode_message(g, input_load_node)                  
                     else:
-                        if layers[layer_start].is_attn == True:
+                        if layers[layer_start].is_attn == True or layers[layer_start].is_expert == True:
                             # Receive input (from the previous layer in another npu group)
                             receive_input_node = self.get_comm_node(
                                 is_send=False,
@@ -481,16 +542,28 @@ class LLMConverter:
                             encode_message(g, receive_input_node)
 
                     attn_start = False
+                    expert_start = False
                     layer_num = layer_start
-                    while attn_start or layer_num < layer_end:
-                        if attn_start:
+                    while attn_start or expert_start or layer_num < layer_end:
+                        if attn_start or expert_start:
                             # attention has no memory need to consider only input, output
-                            # each attention is loaded in a NPU so the npus_per_group should be 1
+                            # each attention/expert is loaded in a NPU so the npus_per_group should be 1
                             npus_comp = 1
                         else:
                             npus_comp = npus_per_group
                         # check attention layer
-                        if layers[layer_num].is_attn == False:
+                        if layers[layer_num].is_attn == False and layers[layer_num].is_expert == False:
+                            if expert_start == True and self.expert_offloading == True and layers[layer_num].weight_memory_size > 0:
+                                # Load expert weight (for expert layers in expert offloading)
+                                expert_weight_load_node = self.get_memory_load_node(
+                                    layers[layer_num].name,
+                                    "WEIGHT",
+                                    layers[layer_num].weight_memory_loc,
+                                    layers[layer_num].weight_memory_size // npus_per_group,
+                                )
+                                layers[layer_num].weight_memory_node = expert_weight_load_node
+                                encode_message(g, expert_weight_load_node)
+                                self.add_parent(expert_weight_load_node, comp_node) # dependent to previous comp_node due to gate function
                             # Compute
                             if layers[layer_num].comp_time != 0:
                                 comp_node = self.get_comp_node(
@@ -507,8 +580,12 @@ class LLMConverter:
                                         self.add_parent(comp_node, evict)
                                     if load != None:
                                         self.add_parent(comp_node, load)
+                                    if layers[layer_num].weight_memory_node != None:
+                                        self.add_parent(comp_node, layers[layer_num].weight_memory_node)
                                     first_comp_node = False
                                 else:
+                                    if layers[layer_num].weight_memory_node != None:
+                                        self.add_parent(comp_node, layers[layer_num].weight_memory_node)
                                     if layers[layer_num - 1].comm_node != None:
                                         self.add_parent(comp_node, layers[layer_num - 1].comm_node)
                                     elif layers[layer_num - 1].comp_node != None:
@@ -555,7 +632,7 @@ class LLMConverter:
                             # add layer_num
                             layer_num += 1
                         # attention layer starts
-                        else:
+                        elif layers[layer_num].is_attn == True:
                             attn_start = True
                             # check attention end
                             if layers[layer_num].attn_num == 'END':
@@ -563,12 +640,45 @@ class LLMConverter:
                                 layers[layer_num].comp_node = comp_node # is latest comp_node
                                 layer_num += 1
                                 continue
+                            # round robin assignment
                             attn_id = int(layers[layer_num].attn_num) % npus_per_group
                             if npu_offset != attn_id:
                                 # go to next attention
                                 while True:
                                     layer_num += 1
                                     if layers[layer_num].is_attn:
+                                        break
+                            else:
+                                layers[layer_num].comp_node = comp_node # is latest comp_node
+                                layer_num += 1
+                        # expert layer starts
+                        elif layers[layer_num].is_expert == True:
+                            if expert_start == False and use_comm:
+                                # Start of expert, add ALLTOALL communication before expert computation
+                                comm_coll_node = self.get_comm_coll_node("expert_start", layers[layer_num].comm_type, layers[layer_num-1].output_memory_size // npus_per_group)
+                                layers[layer_num].comm_node = comm_coll_node
+                                self.add_parent(comm_coll_node, comp_node)
+                                encode_message(g, comm_coll_node)
+                            expert_start = True
+                            # check expert end
+                            if layers[layer_num].expert_num == 'END':
+                                expert_start = False
+                                layers[layer_num].comp_node = comp_node # is latest comp_node
+                                layer_num += 1
+                                # End of expert, add ALLTOALL communication after expert computation
+                                if use_comm:
+                                    comm_coll_node = self.get_comm_coll_node("expert_end", layers[layer_num].comm_type, layers[layer_num+1].input_memory_size // npus_per_group)
+                                    layers[layer_num].comm_node = comm_coll_node
+                                    self.add_parent(comm_coll_node, comp_node)
+                                    encode_message(g, comm_coll_node)
+                                continue
+                            # round robin assignment
+                            expert_id = int(layers[layer_num].expert_num) % npus_per_group
+                            if npu_offset != expert_id:
+                                # go to next expert
+                                while True:
+                                    layer_num += 1
+                                    if layers[layer_num].is_expert:
                                         break
                             else:
                                 layers[layer_num].comp_node = comp_node # is latest comp_node
@@ -605,7 +715,7 @@ class LLMConverter:
                         )
                         encode_message(s, recv_output_node)
                     else:
-                        if layers[layer_end - 1].is_attn == True:
+                        if layers[layer_end - 1].is_attn == True or layers[layer_end - 1].is_expert == True:
                             # Send output (to the next layer in another npu group)
                             send_output_node = self.get_comm_node(
                                 is_send=True,
