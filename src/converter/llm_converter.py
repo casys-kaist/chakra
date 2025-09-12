@@ -288,12 +288,6 @@ class LLMConverter:
                     expert_start = False
                     layer_num = layer_start
                     while attn_start or expert_start or layer_num < layer_end:
-                        if attn_start or expert_start:
-                            # attention has no memory need to consider only input, output
-                            # each attention/expert is loaded in a NPU so the npus_per_group should be 1
-                            npus_comp = 1
-                        else:
-                            npus_comp = npus_per_group
                         # check attention layer
                         if layers[layer_num].is_attn == False and layers[layer_num].is_expert == False:
                             if expert_start == True and self.expert_offloading == True and layers[layer_num].weight_memory_size > 0:
@@ -311,7 +305,7 @@ class LLMConverter:
                             if layers[layer_num].comp_time != 0:
                                 comp_node = self.get_comp_node(
                                     layers[layer_num].name, 
-                                    layers[layer_num].comp_time // npus_comp)
+                                    layers[layer_num].comp_time)
                                 layers[layer_num].comp_node = comp_node
 
                                 if first_comp_node:
@@ -545,12 +539,6 @@ class LLMConverter:
                     expert_start = False
                     layer_num = layer_start
                     while attn_start or expert_start or layer_num < layer_end:
-                        if attn_start or expert_start:
-                            # attention has no memory need to consider only input, output
-                            # each attention/expert is loaded in a NPU so the npus_per_group should be 1
-                            npus_comp = 1
-                        else:
-                            npus_comp = npus_per_group
                         # check attention layer
                         if layers[layer_num].is_attn == False and layers[layer_num].is_expert == False:
                             if expert_start == True and self.expert_offloading == True and layers[layer_num].weight_memory_size > 0:
@@ -568,7 +556,7 @@ class LLMConverter:
                             if layers[layer_num].comp_time != 0:
                                 comp_node = self.get_comp_node(
                                     layers[layer_num].name, 
-                                    layers[layer_num].comp_time // npus_comp)
+                                    layers[layer_num].comp_time)
                                 layers[layer_num].comp_node = comp_node
 
                                 if first_comp_node:
@@ -844,12 +832,6 @@ class LLMConverter:
                     pim_send_output_node = None
                     pim_receive_input_node = None
                     while attn_start or layer_num < layer_end:
-                        if attn_start:
-                            # attention has no memory need to consider only input, output
-                            # each attention is loaded in a NPU so the npus_per_group should be 1
-                            npus_comp = 1
-                        else:
-                            npus_comp = npus_per_group
                         # check attention layer
                         if layers[layer_num].is_attn == False:
                             # check pim
@@ -860,7 +842,7 @@ class LLMConverter:
                                     is_send=True,
                                     layer_name=layers[layer_num].name,
                                     comm_type=layers[layer_num].comm_type,
-                                    comm_size=layers[layer_num].input_memory_size // npus_comp,
+                                    comm_size=layers[layer_num].input_memory_size,
                                     comm_src=npu_id,
                                     comm_dst=npu_id + self.num_npus,
                                     id=send_id
@@ -875,7 +857,7 @@ class LLMConverter:
                                         is_send=False,
                                         layer_name=layers[layer_num].name,
                                         comm_type=layers[layer_num].comm_type,
-                                        comm_size=layers[layer_num].input_memory_size // npus_comp,
+                                        comm_size=layers[layer_num].input_memory_size,
                                         comm_src=npu_id + self.num_npus,
                                         comm_dst=npu_id,
                                         id=send_id
@@ -891,7 +873,7 @@ class LLMConverter:
                                 if layers[layer_num].comp_time != 0:
                                     comp_node = self.get_comp_node(
                                         layers[layer_num].name, 
-                                        layers[layer_num].comp_time // npus_comp)
+                                        layers[layer_num].comp_time)
                                     layers[layer_num].comp_node = comp_node
 
                                     if first_comp_node:
@@ -1022,12 +1004,6 @@ class LLMConverter:
                     send_output_node = None
 
                     while attn_start or layer_num < layer_end:
-                        if attn_start:
-                            # attention has no memory need to consider only input, output
-                            # each attention is loaded in a NPU so the npus_per_group should be 1
-                            npus_comp = 1
-                        else:
-                            npus_comp = npus_per_group
                         # check attention layer
                         if layers[layer_num].is_attn == False:
                             # check pim
@@ -1038,7 +1014,7 @@ class LLMConverter:
                                         is_send=False,
                                         layer_name=layers[layer_num].name,
                                         comm_type=layers[layer_num].comm_type,
-                                        comm_size=layers[layer_num].input_memory_size // npus_comp,
+                                        comm_size=layers[layer_num].input_memory_size,
                                         comm_src=npu_id - self.num_npus,
                                         comm_dst=npu_id,
                                         id=send_id
@@ -1050,7 +1026,7 @@ class LLMConverter:
                                 # compute gemm
                                 comp_node = self.get_comp_node(
                                         layers[layer_num].name, 
-                                        layers[layer_num].comp_time // npus_comp)
+                                        layers[layer_num].comp_time)
                                 layers[layer_num].comp_node = comp_node
                                 self.add_parent(comp_node, receive_input_node)
                                 encode_message(g, comp_node)
@@ -1061,7 +1037,7 @@ class LLMConverter:
                                     is_send=True,
                                     layer_name=layers[layer_num].name,
                                     comm_type=layers[layer_num].comm_type,
-                                    comm_size=layers[layer_num].input_memory_size // npus_comp,
+                                    comm_size=layers[layer_num].input_memory_size,
                                     comm_src=npu_id,
                                     comm_dst=npu_id - self.num_npus,
                                     id=send_id
