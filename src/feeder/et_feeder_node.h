@@ -31,6 +31,8 @@ class ETFeederNode {
   uint64_t runtime();
   uint64_t num_ops();
   uint32_t tensor_loc();
+  uint32_t tensor_device();
+  uint32_t tensor_channel();
   uint64_t tensor_size();
   ChakraProtoMsg::CollectiveCommType comm_type();
   uint32_t comm_priority();
@@ -66,6 +68,8 @@ class ETFeederNode {
   uint64_t runtime_;
   uint64_t num_ops_;
   uint32_t tensor_loc_;
+  uint32_t tensor_device_;
+  uint32_t tensor_channel_;
   uint64_t tensor_size_;
   ChakraProtoMsg::CollectiveCommType comm_type_;
   uint32_t comm_priority_;

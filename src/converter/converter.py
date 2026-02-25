@@ -37,7 +37,7 @@ def convert_pytorch(args: argparse.Namespace) -> None:
 
 def convert_llm(args: argparse.Namespace) -> None:
     """Convert llm text input trace to Chakra execution trace."""
-    converter = LLMConverter(args.input, args.output, args.num_npus, args.npu_offset, args.expert_offloading)
+    converter = LLMConverter(args.input, args.output, args.num_npus, args.npu_offset, args.local_offloading)
     converter.convert()
 
 
@@ -141,12 +141,12 @@ def main() -> None:
     )
 
     llm_parser.add_argument(
-        "--expert-offloading",
+        "--local-offloading",
         action="store_true",
-        help="Enable expert offloading or not. Default is False.",
+        help="Enable weight offloading in local (device) memory. Default is False.",
         default=False,
     )
-
+    
     llm_parser.set_defaults(func=convert_llm)
 
     args = parser.parse_args()

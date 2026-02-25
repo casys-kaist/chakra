@@ -15,32 +15,33 @@ class MemoryType(Enum):
     INVALID_MEMORY = 0
     LOCAL_MEMORY = 1
     REMOTE_MEMORY = 2
-    STORAGE_MEMORY = 3
+    CXL_MEMORY = 3
+    STORAGE_MEMORY = 4
 
 
 class Layer:
     def __init__(self, line: str):
         try:
             col = line.strip().split()
-            if col[0] == 'ATTENTION': # If Attention Flag
-                self.name = col[0]
-                self.attn_num = col[1]
-                self.is_attn = True
-                self.is_expert = False
-                self.comm_node = None
-                self.comp_node = None
-                self.comm_type = "NONE"
-            elif col[0] == 'EXPERT': # If Expert Flag
+            if col[0] == 'EXPERT': # If Expert Flag
                 self.name = col[0]
                 self.expert_num = col[1]
-                self.is_attn = False
                 self.is_expert = True
+                self.is_pim = False
                 self.comm_node = None
                 self.comp_node = None
                 self.comm_type = "ALLTOALL"
-            else:
-                self.is_attn = False
+            elif col[0] == 'PIM': # If PIM Flag
+                self.name = col[0]
+                self.pim_num = col[1]
                 self.is_expert = False
+                self.is_pim = True
+                self.comm_node = None
+                self.comp_node = None
+                self.comm_type = "NONE"
+            else:
+                self.is_expert = False
+                self.is_pim = False
                 self.name = col[0]
 
                 # compuation
@@ -74,13 +75,13 @@ class LLMConverter:
         output_filename: str,
         num_npus: int,
         npu_offset: int = 0,
-        expert_offloading: bool = False,
+        local_offloading: bool = False,
     ):
         self.input_filename = input_filename
         self.output_filename = output_filename
         self.num_npus = num_npus
         self.npu_offset = npu_offset
-        self.expert_offloading = expert_offloading
+        self.local_offloading = local_offloading
         self.next_node_id = 0
 
         # For send & recv nodes
@@ -170,27 +171,78 @@ class LLMConverter:
         return node
     
     def get_mem_type(self, mem_type: str) -> int:
-        if mem_type == "LOCAL_MEMORY":
+        mem_type = mem_type.split(':')[0]  # Exclude the device number if present
+        if mem_type == "LOCAL":
             return MemoryType.LOCAL_MEMORY.value
-        elif mem_type == "REMOTE_MEMORY":
+        elif mem_type == "REMOTE":
             return MemoryType.REMOTE_MEMORY.value
-        elif mem_type == "STORAGE_MEMORY":
+        elif mem_type == "CXL":
+            return MemoryType.CXL_MEMORY.value
+        elif mem_type == "STORAGE":
             return MemoryType.STORAGE_MEMORY.value
         return MemoryType.INVALID_MEMORY.value
+    
+    def get_mem_device(self, mem_type: str) -> int:
+        """
+        Extract the device index from mem_type.
+
+        Supported formats:
+        - "REMOTE"          -> returns 0
+        - "REMOTE:1"        -> returns 1
+        - "REMOTE:1.3"      -> returns 1  (device = 1, channel = 3)
+        """
+        parts = mem_type.split(":", 1)
+        if len(parts) == 2:
+            # parts[1] may be "1" or "1.3"
+            dev_part = parts[1].split(".", 1)[0]
+            if dev_part.isdigit():
+                return int(dev_part)
+        return 0  # Default device number
+
+
+    def get_mem_channel(self, mem_type: str) -> int:
+        """
+        Extract the channel index from mem_type.
+
+        Supported formats:
+        - "REMOTE"          -> returns 0
+        - "REMOTE:1"        -> returns 0  (no channel specified)
+        - "REMOTE:1.3"      -> returns 3  (channel = 3)
+        """
+        parts = mem_type.split(":", 1)
+        if len(parts) == 2:
+            # parts[1] may be "1" or "1.3"
+            sub = parts[1].split(".", 1)
+            if len(sub) == 2:
+                chan_part = sub[1]
+                if chan_part.isdigit():
+                    return int(chan_part)
+        return 0  # Default channel number
 
 
     def get_memory_load_node(self, layer_name: str, tensor_type: str, mem_type: str, tensor_size: int) -> Any:
         node = self.get_node("MEM_LOAD_NODE_" + layer_name + "_" + tensor_type, MEM_LOAD_NODE)
         node.attr.append(ChakraAttr(name="tensor_size", uint64_val=tensor_size))
         node.attr.append(ChakraAttr(name="tensor_loc", uint32_val=self.get_mem_type(mem_type)))
+        node.attr.append(ChakraAttr(name="tensor_device", uint32_val=self.get_mem_device(mem_type)))
         return node
 
     def get_memory_store_node(self, layer_name: str, tensor_type: str, mem_type: str, tensor_size: int) -> Any:
         node = self.get_node("MEM_STORE_NODE_" + layer_name + "_" + tensor_type, MEM_STORE_NODE)
         node.attr.append(ChakraAttr(name="tensor_size", uint64_val=tensor_size))
         node.attr.append(ChakraAttr(name="tensor_loc", uint32_val=self.get_mem_type(mem_type)))
+        node.attr.append(ChakraAttr(name="tensor_device", uint32_val=self.get_mem_device(mem_type)))
         return node
 
+    def get_pim_compute_node(self, layer_name: str, tensor_type: str, comp_time: int, mem_type: str, tensor_size: int) -> Any:
+        node = self.get_node("PIM_COMP_NODE_" + layer_name + "_" + tensor_type, PIM_COMP_NODE)
+        node.duration_micros = comp_time
+        node.attr.append(ChakraAttr(name="tensor_size", uint64_val=tensor_size))
+        node.attr.append(ChakraAttr(name="tensor_loc", uint32_val=self.get_mem_type(mem_type)))
+        node.attr.append(ChakraAttr(name="tensor_device", uint32_val=self.get_mem_device(mem_type)))
+        node.attr.append(ChakraAttr(name="tensor_channel", uint32_val=self.get_mem_channel(mem_type)))
+        return node
+        
     def add_parent(self, child_node: Any, parent_node: Any) -> None:
         child_node.data_deps.append(parent_node.id)
 
@@ -257,17 +309,17 @@ class LLMConverter:
                             layers[layer_start].name,
                             "INPUT",
                             layers[layer_start].input_memory_loc,
-                            layers[layer_start].input_memory_size // npus_per_group,
+                            layers[layer_start].input_memory_size,
                         )
                         encode_message(g, input_load_node)                  
                     else:
-                        if layers[layer_start].is_attn == True or layers[layer_start].is_expert == True:
+                        if layers[layer_start].is_expert or layers[layer_start].is_pim:
                             # Receive input (from the previous layer in another npu group)
                             receive_input_node = self.get_comm_node(
                                 is_send=False,
                                 layer_name=layers[layer_start-1].name,
                                 comm_type=layers[layer_start-1].comm_type,
-                                comm_size=layers[layer_start-1].output_memory_size // npus_per_group,
+                                comm_size=layers[layer_start-1].output_memory_size,
                                 comm_src=npu_id - npus_per_group,
                                 comm_dst=npu_id
                             )
@@ -278,63 +330,107 @@ class LLMConverter:
                                 is_send=False,
                                 layer_name=layers[layer_start].name,
                                 comm_type=layers[layer_start].comm_type,
-                                comm_size=layers[layer_start].input_memory_size // npus_per_group,
+                                comm_size=layers[layer_start].input_memory_size,
                                 comm_src=npu_id - npus_per_group,
                                 comm_dst=npu_id
                             )
                             encode_message(g, receive_input_node)
 
-                    attn_start = False
                     expert_start = False
+                    pim_start = False
+                    attn_remain = False # to handle remaining prefill attention after pim
+                    pim_parent_nodes = []
+                    pim_comp_nodes = []
+                    past_pim_comp_nodes = []
+                    last_batch_type = "BATCH_1"
                     layer_num = layer_start
-                    while attn_start or expert_start or layer_num < layer_end:
-                        # check attention layer
-                        if layers[layer_num].is_attn == False and layers[layer_num].is_expert == False:
-                            if expert_start == True and self.expert_offloading == True and layers[layer_num].weight_memory_size > 0:
-                                # Load expert weight (for expert layers in expert offloading)
-                                expert_weight_load_node = self.get_memory_load_node(
+                    while expert_start or pim_start or attn_remain or layer_num < layer_end:
+                        if not layers[layer_num].is_expert and not layers[layer_num].is_pim: 
+                            if (self.local_offloading or layers[layer_num].weight_memory_loc != "LOCAL") and layers[layer_num].weight_memory_size > 0:
+                                # Load weight (for weight offloading)
+                                weight_load_node = self.get_memory_load_node(
                                     layers[layer_num].name,
                                     "WEIGHT",
                                     layers[layer_num].weight_memory_loc,
-                                    layers[layer_num].weight_memory_size // npus_per_group,
+                                    layers[layer_num].weight_memory_size,
                                 )
-                                layers[layer_num].weight_memory_node = expert_weight_load_node
-                                encode_message(g, expert_weight_load_node)
-                                self.add_parent(expert_weight_load_node, comp_node) # dependent to previous comp_node due to gate function
+                                layers[layer_num].weight_memory_node = weight_load_node
+                                if expert_start:
+                                    self.add_parent(weight_load_node, comp_node) # dependent to previous comp_node due to gate function
+                                encode_message(g, weight_load_node)
                             # Compute
-                            if layers[layer_num].comp_time != 0:
+                            if layers[layer_num].comp_time != 0 and not pim_start: # pim computation is handled pim_comp_node
                                 comp_node = self.get_comp_node(
                                     layers[layer_num].name, 
                                     layers[layer_num].comp_time)
                                 layers[layer_num].comp_node = comp_node
 
-                                if first_comp_node:
-                                    if npu_group == 0:
-                                        self.add_parent(comp_node, input_load_node)
+                                # handle pim parent nodes, and if prefill attention remains wait until all attention is done (before o_proj)
+                                if len(pim_parent_nodes) != 0:
+                                    if attn_remain:
+                                        for parent in pim_parent_nodes: 
+                                            self.add_parent(comp_node, parent)
+                                    pim_parent_nodes = [] # reset pim parent nodes
+
+                                    if "attn" in layers[layer_num].name:
+                                        attn_remain = False
+                                else: 
+                                    if first_comp_node:
+                                        if npu_group == 0:
+                                            self.add_parent(comp_node, input_load_node)
+                                        else:
+                                            self.add_parent(comp_node, receive_input_node)
+                                        if evict != None:
+                                            self.add_parent(comp_node, evict)
+                                        if load != None:
+                                            self.add_parent(comp_node, load)
+                                        if layers[layer_num].weight_memory_node != None:
+                                            self.add_parent(comp_node, layers[layer_num].weight_memory_node)
+                                        first_comp_node = False
                                     else:
-                                        self.add_parent(comp_node, receive_input_node)
-                                    if evict != None:
-                                        self.add_parent(comp_node, evict)
-                                    if load != None:
-                                        self.add_parent(comp_node, load)
-                                    if layers[layer_num].weight_memory_node != None:
-                                        self.add_parent(comp_node, layers[layer_num].weight_memory_node)
-                                    first_comp_node = False
-                                else:
-                                    if layers[layer_num].weight_memory_node != None:
-                                        self.add_parent(comp_node, layers[layer_num].weight_memory_node)
-                                    if layers[layer_num - 1].comm_node != None:
-                                        self.add_parent(comp_node, layers[layer_num - 1].comm_node)
-                                    elif layers[layer_num - 1].comp_node != None:
-                                        self.add_parent(comp_node, layers[layer_num - 1].comp_node)
-                                    else:
-                                        self.add_parent(comp_node, layers[layer_num - 2].comp_node)
-                                
+                                        if layers[layer_num].weight_memory_node != None:
+                                            self.add_parent(comp_node, layers[layer_num].weight_memory_node)
+                                        if layers[layer_num - 1].comm_node != None:
+                                            self.add_parent(comp_node, layers[layer_num - 1].comm_node)
+                                        elif layers[layer_num - 1].comp_node != None:
+                                            self.add_parent(comp_node, layers[layer_num - 1].comp_node)
+                                        else:
+                                            print(layers[layer_num - 2].name, layers[layer_num - 1].name, layers[layer_num].name)
+                                            self.add_parent(comp_node, layers[layer_num - 2].comp_node)
+
+                                # handle pim_compute_mode dependency & should not be remaining attention
+                                if not attn_remain and len(pim_comp_nodes) != 0:
+                                    if layers[layer_num].misc == "NONE": # no sub-batch interleaving
+                                        for pim_comp in pim_comp_nodes:
+                                            self.add_parent(comp_node, pim_comp)
+                                        pim_comp_nodes = [] # reset pim comp nodes
+                                    elif layers[layer_num].misc != last_batch_type:
+                                        if len(past_pim_comp_nodes) != 0:
+                                            for pim_comp in past_pim_comp_nodes:
+                                                self.add_parent(comp_node, pim_comp)
+                                        past_pim_comp_nodes = pim_comp_nodes # update past pim comp nodes
+                                        pim_comp_nodes = [] # reset pim comp nodes
+                                        last_batch_type = layers[layer_num].misc
+
                                 encode_message(g, comp_node)
+
+                            # PIM compute
+                            if pim_start:
+                                pim_comp_node = self.get_pim_compute_node(
+                                    layers[layer_num].name,
+                                    "PIM",
+                                    layers[layer_num].comp_time,
+                                    layers[layer_num].input_memory_loc,
+                                    layers[layer_num].input_memory_size + layers[layer_num].output_memory_size # load/store from pim
+                                )
+                                pim_comp_nodes.append(pim_comp_node)
+                                for parent in pim_parent_nodes:
+                                    self.add_parent(pim_comp_node, parent)
+                                encode_message(g, pim_comp_node)
 
                             # Communication (if required)
                             if layers[layer_num].comm_type != "NONE" and use_comm:
-                                comm_coll_node = self.get_comm_coll_node(layers[layer_num].name, layers[layer_num].comm_type, layers[layer_num].comm_size // npus_per_group)
+                                comm_coll_node = self.get_comm_coll_node(layers[layer_num].name, layers[layer_num].comm_type, layers[layer_num].comm_size)
                                 # for j in range(self.num_dims):
                                 # comm_coll_node.involved_dim.append(True)
                                 layers[layer_num].comm_node = comm_coll_node
@@ -343,31 +439,11 @@ class LLMConverter:
                                 encode_message(g, comm_coll_node)
                             # add layer_num
                             layer_num += 1
-                        # attention layer starts
-                        elif layers[layer_num].is_attn == True:
-                            attn_start = True
-                            # check attention end
-                            if layers[layer_num].attn_num == 'END':
-                                attn_start = False
-                                layers[layer_num].comp_node = comp_node # is latest comp_node
-                                layer_num += 1
-                                continue
-                            # round robin assignment
-                            attn_id = int(layers[layer_num].attn_num) % npus_per_group
-                            if npu_offset != attn_id:
-                                # go to next attention
-                                while True:
-                                    layer_num += 1
-                                    if layers[layer_num].is_attn:
-                                        break
-                            else:
-                                layers[layer_num].comp_node = comp_node # is latest comp_node
-                                layer_num += 1
                         # expert layer starts
-                        elif layers[layer_num].is_expert == True:
+                        elif layers[layer_num].is_expert:
                             if expert_start == False and use_comm:
                                 # Start of expert, add ALLTOALL communication before expert computation
-                                comm_coll_node = self.get_comm_coll_node("expert_start", layers[layer_num].comm_type, layers[layer_num-1].output_memory_size // npus_per_group)
+                                comm_coll_node = self.get_comm_coll_node("expert_start", layers[layer_num].comm_type, layers[layer_num-1].output_memory_size)
                                 layers[layer_num].comm_node = comm_coll_node
                                 self.add_parent(comm_coll_node, comp_node)
                                 encode_message(g, comm_coll_node)
@@ -379,7 +455,7 @@ class LLMConverter:
                                 layer_num += 1
                                 # End of expert, add ALLTOALL communication after expert computation
                                 if use_comm:
-                                    comm_coll_node = self.get_comm_coll_node("expert_end", layers[layer_num].comm_type, layers[layer_num+1].input_memory_size // npus_per_group)
+                                    comm_coll_node = self.get_comm_coll_node("expert_end", layers[layer_num].comm_type, layers[layer_num+1].input_memory_size)
                                     layers[layer_num].comm_node = comm_coll_node
                                     self.add_parent(comm_coll_node, comp_node)
                                     encode_message(g, comm_coll_node)
@@ -395,6 +471,47 @@ class LLMConverter:
                             else:
                                 layers[layer_num].comp_node = comp_node # is latest comp_node
                                 layer_num += 1
+                        # pim layer starts
+                        elif layers[layer_num].is_pim:
+                            pim_start = True
+                            # check attention end
+                            if layers[layer_num].pim_num == 'END':
+                                pim_start = False
+                                if "attn" in layers[layer_num + 1].name:
+                                    attn_remain = True # prefill attn remains
+                                layer_num += 1
+                                continue
+                            # add pim parent nodes for dependency
+                            elif int(layers[layer_num].pim_num) == 0:
+                                if first_comp_node:
+                                    if npu_group == 0:
+                                        pim_parent_nodes.append()
+                                    else:
+                                        pim_parent_nodes.append(receive_input_node)
+                                    if evict != None:
+                                        pim_parent_nodes.append(evict)
+                                    if load != None:
+                                        pim_parent_nodes.append(load)
+                                    # discarded weight parent because attention has no weight
+                                    first_comp_node = False
+                                else:
+                                    # discarded weight parent because attention has no weight
+                                    if layers[layer_num - 1].comm_node != None:
+                                        pim_parent_nodes.append(layers[layer_num - 1].comm_node)
+                                    elif layers[layer_num - 1].comp_node != None:
+                                        pim_parent_nodes.append(layers[layer_num - 1].comp_node)
+                                    else:
+                                        pim_parent_nodes.append(layers[layer_num - 1].comp_node)
+                            # round robin assignment
+                            pim_id = int(layers[layer_num].pim_num) % npus_per_group
+                            if npu_offset != pim_id:
+                                # go to next attention
+                                while True:
+                                    layer_num += 1
+                                    if layers[layer_num].is_pim:
+                                        break
+                            else:
+                                layer_num += 1
 
                     # update new layer_end
                     layer_end = layer_num
@@ -405,8 +522,13 @@ class LLMConverter:
                             layers[layer_end - 1].name,
                             "OUTPUT",
                             layers[layer_end - 1].output_memory_loc,
-                            layers[layer_end - 1].input_memory_size // npus_per_group,
+                            layers[layer_end - 1].input_memory_size,
                         )
+                        # if pim_comp_nodes are not consumed yet, add dependency
+                        if len(pim_comp_nodes) != 0:
+                            for pim_comp in pim_comp_nodes:
+                                self.add_parent(send_output_node, pim_comp)
+                                pim_comp_nodes = []
                         if layers[layer_end - 1].comm_type != "NONE" and use_comm:
                             self.add_parent(output_store_node, comm_coll_node)
                         elif layers[layer_end - 1].comp_node != None:
@@ -415,13 +537,13 @@ class LLMConverter:
                             self.add_parent(output_store_node, layers[layer_end - 2].comp_node)
                         encode_message(g, output_store_node)
                     else:
-                        if layers[layer_end - 1].is_attn == True or layers[layer_end - 1].is_expert == True:
+                        if layers[layer_end - 1].is_expert or layers[layer_end - 1].is_pim:
                             # Send output (to the next layer in another npu group)
                             send_output_node = self.get_comm_node(
                                 is_send=True,
                                 layer_name=layers[layer_end].name,
                                 comm_type=layers[layer_end].comm_type,
-                                comm_size=layers[layer_end].input_memory_size // npus_per_group,
+                                comm_size=layers[layer_end].input_memory_size,
                                 comm_src=npu_id,
                                 comm_dst=npu_id + npus_per_group
                             )
@@ -430,10 +552,15 @@ class LLMConverter:
                                 is_send=True,
                                 layer_name=layers[layer_end - 1].name,
                                 comm_type=layers[layer_end - 1].comm_type,
-                                comm_size=layers[layer_end - 1].output_memory_size // npus_per_group,
+                                comm_size=layers[layer_end - 1].output_memory_size,
                                 comm_src=npu_id,
                                 comm_dst=npu_id + npus_per_group
                             )
+                        # if pim_comp_nodes are not consumed yet, add dependency
+                        if len(pim_comp_nodes) != 0:
+                            for pim_comp in pim_comp_nodes:
+                                self.add_parent(send_output_node, pim_comp)
+                                pim_comp_nodes = []
                         if layers[layer_end - 1].comm_type != "NONE" and use_comm:
                             self.add_parent(send_output_node, comm_coll_node)
                         elif layers[layer_end - 1].comp_node != None:
@@ -445,6 +572,7 @@ class LLMConverter:
     
     def convert_prefill(self, f: TextIOWrapper, num_layers: int, num_npu_group: int):
         layers: list[Layer] = self.get_layers(f)
+        # There will be no pim operation in prefill (PIM cannot perform GEMM)
 
         # vllm: check eviction or load
         evict = None
@@ -508,17 +636,17 @@ class LLMConverter:
                             layers[layer_start].name,
                             "INPUT",
                             layers[layer_start].input_memory_loc,
-                            layers[layer_start].input_memory_size // npus_per_group,
+                            layers[layer_start].input_memory_size,
                         )
                         encode_message(g, input_load_node)                  
                     else:
-                        if layers[layer_start].is_attn == True or layers[layer_start].is_expert == True:
+                        if layers[layer_start].is_expert:
                             # Receive input (from the previous layer in another npu group)
                             receive_input_node = self.get_comm_node(
                                 is_send=False,
                                 layer_name=layers[layer_start-1].name,
                                 comm_type=layers[layer_start-1].comm_type,
-                                comm_size=layers[layer_start-1].output_memory_size // npus_per_group,
+                                comm_size=layers[layer_start-1].output_memory_size,
                                 comm_src=npu_id - npus_per_group,
                                 comm_dst=npu_id
                             )
@@ -529,29 +657,29 @@ class LLMConverter:
                                 is_send=False,
                                 layer_name=layers[layer_start].name,
                                 comm_type=layers[layer_start].comm_type,
-                                comm_size=layers[layer_start].input_memory_size // npus_per_group,
+                                comm_size=layers[layer_start].input_memory_size,
                                 comm_src=npu_id - npus_per_group,
                                 comm_dst=npu_id
                             )
                             encode_message(g, receive_input_node)
 
-                    attn_start = False
                     expert_start = False
                     layer_num = layer_start
-                    while attn_start or expert_start or layer_num < layer_end:
-                        # check attention layer
-                        if layers[layer_num].is_attn == False and layers[layer_num].is_expert == False:
-                            if expert_start == True and self.expert_offloading == True and layers[layer_num].weight_memory_size > 0:
-                                # Load expert weight (for expert layers in expert offloading)
-                                expert_weight_load_node = self.get_memory_load_node(
+                    while expert_start or layer_num < layer_end:
+                        if not layers[layer_num].is_expert:
+                            if (self.local_offloading or layers[layer_num].weight_memory_loc != "LOCAL") and layers[layer_num].weight_memory_size > 0:
+                                # Load weight (for weight offloading)
+                                weight_load_node = self.get_memory_load_node(
                                     layers[layer_num].name,
                                     "WEIGHT",
                                     layers[layer_num].weight_memory_loc,
-                                    layers[layer_num].weight_memory_size // npus_per_group,
+                                    layers[layer_num].weight_memory_size,
                                 )
-                                layers[layer_num].weight_memory_node = expert_weight_load_node
-                                encode_message(g, expert_weight_load_node)
-                                self.add_parent(expert_weight_load_node, comp_node) # dependent to previous comp_node due to gate function
+                                layers[layer_num].weight_memory_node = weight_load_node
+                                if expert_start:
+                                    self.add_parent(weight_load_node, comp_node) # dependent to previous comp_node due to gate function
+                                encode_message(g, weight_load_node)
+                            
                             # Compute
                             if layers[layer_num].comp_time != 0:
                                 comp_node = self.get_comp_node(
@@ -589,7 +717,7 @@ class LLMConverter:
                                         is_send=True,
                                         layer_name="kv_proj",
                                         comm_type=layers[layer_num].comm_type,
-                                        comm_size=layers[layer_num].output_memory_size // npus_per_group * 2,
+                                        comm_size=layers[layer_num].output_memory_size,
                                         comm_src=npu_id,
                                         comm_dst=npu_id + self.num_npus, # to the paired npu in decode
                                         id=layer_num
@@ -601,7 +729,7 @@ class LLMConverter:
                                         is_send=False,
                                         layer_name="kv_proj",
                                         comm_type=layers[layer_num].comm_type,
-                                        comm_size=layers[layer_num].output_memory_size // npus_per_group * 2,
+                                        comm_size=layers[layer_num].output_memory_size,
                                         comm_src=npu_id,
                                         comm_dst=npu_id + self.num_npus,
                                         id=layer_num
@@ -610,7 +738,7 @@ class LLMConverter:
 
                             # Communication (if required)
                             if layers[layer_num].comm_type != "NONE" and use_comm:
-                                comm_coll_node = self.get_comm_coll_node(layers[layer_num].name, layers[layer_num].comm_type, layers[layer_num].comm_size // npus_per_group)
+                                comm_coll_node = self.get_comm_coll_node(layers[layer_num].name, layers[layer_num].comm_type, layers[layer_num].comm_size)
                                 # for j in range(self.num_dims):
                                 # comm_coll_node.involved_dim.append(True)
                                 layers[layer_num].comm_node = comm_coll_node
@@ -619,31 +747,11 @@ class LLMConverter:
                                 encode_message(g, comm_coll_node)
                             # add layer_num
                             layer_num += 1
-                        # attention layer starts
-                        elif layers[layer_num].is_attn == True:
-                            attn_start = True
-                            # check attention end
-                            if layers[layer_num].attn_num == 'END':
-                                attn_start = False
-                                layers[layer_num].comp_node = comp_node # is latest comp_node
-                                layer_num += 1
-                                continue
-                            # round robin assignment
-                            attn_id = int(layers[layer_num].attn_num) % npus_per_group
-                            if npu_offset != attn_id:
-                                # go to next attention
-                                while True:
-                                    layer_num += 1
-                                    if layers[layer_num].is_attn:
-                                        break
-                            else:
-                                layers[layer_num].comp_node = comp_node # is latest comp_node
-                                layer_num += 1
                         # expert layer starts
-                        elif layers[layer_num].is_expert == True:
+                        elif layers[layer_num].is_expert:
                             if expert_start == False and use_comm:
                                 # Start of expert, add ALLTOALL communication before expert computation
-                                comm_coll_node = self.get_comm_coll_node("expert_start", layers[layer_num].comm_type, layers[layer_num-1].output_memory_size // npus_per_group)
+                                comm_coll_node = self.get_comm_coll_node("expert_start", layers[layer_num].comm_type, layers[layer_num-1].output_memory_size)
                                 layers[layer_num].comm_node = comm_coll_node
                                 self.add_parent(comm_coll_node, comp_node)
                                 encode_message(g, comm_coll_node)
@@ -655,7 +763,7 @@ class LLMConverter:
                                 layer_num += 1
                                 # End of expert, add ALLTOALL communication after expert computation
                                 if use_comm:
-                                    comm_coll_node = self.get_comm_coll_node("expert_end", layers[layer_num].comm_type, layers[layer_num+1].input_memory_size // npus_per_group)
+                                    comm_coll_node = self.get_comm_coll_node("expert_end", layers[layer_num].comm_type, layers[layer_num+1].input_memory_size)
                                     layers[layer_num].comm_node = comm_coll_node
                                     self.add_parent(comm_coll_node, comp_node)
                                     encode_message(g, comm_coll_node)
@@ -681,7 +789,7 @@ class LLMConverter:
                             is_send=True,
                             layer_name=layers[layer_end - 1].name,
                             comm_type=layers[layer_end - 1].comm_type,
-                            comm_size=layers[layer_end - 1].output_memory_size // npus_per_group,
+                            comm_size=layers[layer_end - 1].output_memory_size,
                             comm_src=npu_id,
                             comm_dst=npu_id + self.num_npus
                         )
@@ -697,19 +805,19 @@ class LLMConverter:
                             is_send=False,
                             layer_name=layers[layer_end - 1].name,
                             comm_type=layers[layer_end - 1].comm_type,
-                            comm_size=layers[layer_end - 1].output_memory_size // npus_per_group,
+                            comm_size=layers[layer_end - 1].output_memory_size,
                             comm_src=npu_id,
                             comm_dst=npu_id + self.num_npus
                         )
                         encode_message(s, recv_output_node)
                     else:
-                        if layers[layer_end - 1].is_attn == True or layers[layer_end - 1].is_expert == True:
+                        if layers[layer_end - 1].is_expert:
                             # Send output (to the next layer in another npu group)
                             send_output_node = self.get_comm_node(
                                 is_send=True,
                                 layer_name=layers[layer_end].name,
                                 comm_type=layers[layer_end].comm_type,
-                                comm_size=layers[layer_end].input_memory_size // npus_per_group,
+                                comm_size=layers[layer_end].input_memory_size,
                                 comm_src=npu_id,
                                 comm_dst=npu_id + npus_per_group
                             )
@@ -718,7 +826,7 @@ class LLMConverter:
                                 is_send=True,
                                 layer_name=layers[layer_end - 1].name,
                                 comm_type=layers[layer_end - 1].comm_type,
-                                comm_size=layers[layer_end - 1].output_memory_size // npus_per_group,
+                                comm_size=layers[layer_end - 1].output_memory_size,
                                 comm_src=npu_id,
                                 comm_dst=npu_id + npus_per_group
                             )
@@ -729,346 +837,6 @@ class LLMConverter:
                         else:
                             self.add_parent(send_output_node, layers[layer_end - 2].comp_node)
                         encode_message(g, send_output_node)
-            remain_layers -= 1
-
-    def convert_pim(self, f: TextIOWrapper, num_layers: int, num_npu_group: int):
-        layers: list[Layer] = self.get_layers(f)
-
-        # vllm: check eviction or load
-        evict = None
-        load = None
-        ev_ld_cnt = 0
-        for i in range(2):
-            if 'kv_load' in layers[i].name:
-                load = self.get_memory_load_node(
-                            layers[i].name,
-                            "WEIGHT",
-                            layers[i].weight_memory_loc,
-                            layers[i].weight_memory_size, # already per npu kv_cache size
-                        )
-            elif 'kv_evict' in layers[i].name:
-                evict = self.get_memory_store_node(
-                            layers[i].name,
-                            "WEIGHT",
-                            layers[i].weight_memory_loc,
-                            layers[i].weight_memory_size,
-                        )
-            else:
-                continue
-            ev_ld_cnt += 1
-            
-        layers = layers[ev_ld_cnt:]
-        num_layers -= ev_ld_cnt
-
-        # make npu half
-        self.num_npus = self.num_npus // 2
-
-        if self.num_npus % num_npu_group != 0: print("Warning! num_npus % num_npu_group != 0, Some npus won't do anything!")
-        npus_per_group = self.num_npus // num_npu_group
-        if npus_per_group == 1: # same as pipeline parallelism, ignore all reduce
-            use_comm = False
-        else:
-            use_comm = True
-        layers_per_group = num_layers // num_npu_group
-        remain_layers = num_layers % num_npu_group
-
-        # start NPU POOL
-        layer_start = 0
-        layer_end = 0
-
-        for npu_group in range(num_npu_group):
-            layer_start = layer_end
-            layer_end = layer_start + layers_per_group + (1 if remain_layers > 0 else 0)
-            if layer_end >= num_layers:
-                layer_end = num_layers
-            for npu_offset in range(npus_per_group):
-                npu_id = npu_group * npus_per_group + npu_offset
-                output_filename = "%s.%d.et" % (self.output_filename, npu_id)
-                first_comp_node = True
-                with open(output_filename, "wb") as g:
-                    global_metadata = self.get_global_metadata()
-                    encode_message(g, global_metadata)
-                    # if evict != None:
-                    #     encode_message(g, evict)
-                    # if load != None:
-                    #     encode_message(g, load)
-                    if npu_group == 0:
-                        # Load Input
-                        input_load_node = self.get_memory_load_node(
-                            layers[layer_start].name,
-                            "INPUT",
-                            layers[layer_start].input_memory_loc,
-                            layers[layer_start].input_memory_size // npus_per_group,
-                        )
-                        encode_message(g, input_load_node)                  
-                    else:
-                        if layers[layer_start].is_attn == True:
-                            # Receive input (from the previous layer in another npu group)
-                            receive_input_node = self.get_comm_node(
-                                is_send=False,
-                                layer_name=layers[layer_start-1].name,
-                                comm_type=layers[layer_start-1].comm_type,
-                                comm_size=layers[layer_start-1].output_memory_size // npus_per_group,
-                                comm_src=npu_id - npus_per_group,
-                                comm_dst=npu_id
-                            )
-                            encode_message(g, receive_input_node)
-                        else:
-                            # Receive input (from the previous layer in another npu group)
-                            receive_input_node = self.get_comm_node(
-                                is_send=False,
-                                layer_name=layers[layer_start].name,
-                                comm_type=layers[layer_start].comm_type,
-                                comm_size=layers[layer_start].input_memory_size // npus_per_group,
-                                comm_src=npu_id - npus_per_group,
-                                comm_dst=npu_id
-                            )
-                            encode_message(g, receive_input_node)
-
-                    attn_start = False
-                    layer_num = layer_start
-                    pim = False
-                    send_id = 0
-                    pim_send_output_node = None
-                    pim_receive_input_node = None
-                    while attn_start or layer_num < layer_end:
-                        # check attention layer
-                        if layers[layer_num].is_attn == False:
-                            # check pim
-                            if 'pim' in layers[layer_num].name:
-                                pim = True
-                                # send layer
-                                pim_send_output_node = self.get_comm_node(
-                                    is_send=True,
-                                    layer_name=layers[layer_num].name,
-                                    comm_type=layers[layer_num].comm_type,
-                                    comm_size=layers[layer_num].input_memory_size,
-                                    comm_src=npu_id,
-                                    comm_dst=npu_id + self.num_npus,
-                                    id=send_id
-                                )
-                                # print(npu_id, pim_send_output_node.comm_tag, pim_send_output_node.comm_src, pim_send_output_node.comm_dst, pim_send_output_node.comm_size)
-                                self.add_parent(pim_send_output_node, comp_node)
-                                encode_message(g, pim_send_output_node)
-                            else:
-                                # last layer was pim, recieve from pim
-                                if pim:
-                                    pim_receive_input_node = self.get_comm_node(
-                                        is_send=False,
-                                        layer_name=layers[layer_num].name,
-                                        comm_type=layers[layer_num].comm_type,
-                                        comm_size=layers[layer_num].input_memory_size,
-                                        comm_src=npu_id + self.num_npus,
-                                        comm_dst=npu_id,
-                                        id=send_id
-                                    )
-                                    # print(npu_id, pim_receive_input_node.comm_tag, pim_receive_input_node.comm_src, pim_receive_input_node.comm_dst, pim_receive_input_node.comm_size)
-                                    self.add_parent(pim_receive_input_node, pim_send_output_node)
-                                    encode_message(g, pim_receive_input_node)
-                                    pim = False
-                                    send_id += 1
-                                    pim_send_output_node = None
-
-                                # Compute
-                                if layers[layer_num].comp_time != 0:
-                                    comp_node = self.get_comp_node(
-                                        layers[layer_num].name, 
-                                        layers[layer_num].comp_time)
-                                    layers[layer_num].comp_node = comp_node
-
-                                    if first_comp_node:
-                                        if npu_group == 0:
-                                            self.add_parent(comp_node, input_load_node)
-                                        else:
-                                            self.add_parent(comp_node, receive_input_node)
-                                        if evict != None:
-                                            self.add_parent(comp_node, evict)
-                                        if load != None:
-                                            self.add_parent(comp_node, load)
-                                        first_comp_node = False
-                                    else:
-                                        if layers[layer_num - 1].comm_node != None:
-                                            self.add_parent(comp_node, layers[layer_num - 1].comm_node)
-                                        elif layers[layer_num - 1].comp_node != None:
-                                            self.add_parent(comp_node, layers[layer_num - 1].comp_node)
-                                        else:
-                                            self.add_parent(comp_node, layers[layer_num - 2].comp_node)
-
-                                    if pim_send_output_node == None and pim_receive_input_node != None:
-                                        self.add_parent(comp_node, pim_receive_input_node)
-
-                                    
-                                    encode_message(g, comp_node)
-
-                                # Communication (if required)
-                                if layers[layer_num].comm_type != "NONE" and use_comm:
-                                    comm_coll_node = self.get_comm_coll_node(layers[layer_num].name, layers[layer_num].comm_type, layers[layer_num].comm_size // npus_per_group)
-                                    # for j in range(self.num_dims):
-                                    # comm_coll_node.involved_dim.append(True)
-                                    layers[layer_num].comm_node = comm_coll_node
-                                    if layers[layer_num].comp_time != 0:
-                                        self.add_parent(comm_coll_node, comp_node)
-                                    encode_message(g, comm_coll_node)
-                            # add layer_num
-                            layer_num += 1
-                        # attention layer starts
-                        else:
-                            attn_start = True
-                            # check attention end
-                            if layers[layer_num].attn_num == 'END':
-                                attn_start = False
-                                layers[layer_num].comp_node = comp_node # is latest comp_node
-                                layer_num += 1
-                                continue
-                            attn_id = int(layers[layer_num].attn_num) % npus_per_group
-                            if npu_offset != attn_id:
-                                # go to next attention
-                                while True:
-                                    layer_num += 1
-                                    if layers[layer_num].is_attn:
-                                        break
-                            else:
-                                layers[layer_num].comp_node = comp_node # is latest comp_node
-                                layer_num += 1
-
-                    # update new layer_end
-                    layer_end = layer_num
-
-                    if npu_group == (num_npu_group - 1):
-                        # Store output (for the last layer)
-                        output_store_node = self.get_memory_store_node(
-                            layers[layer_end - 1].name,
-                            "OUTPUT",
-                            layers[layer_end - 1].output_memory_loc,
-                            layers[layer_end - 1].output_memory_size // npus_per_group
-                        )
-                        if layers[layer_end - 1].comm_type != "NONE" and use_comm:
-                            self.add_parent(output_store_node, comm_coll_node)
-                        elif layers[layer_end - 1].comp_node != None:
-                            self.add_parent(output_store_node, comp_node)
-                        else:
-                            self.add_parent(output_store_node, layers[layer_end - 2].comp_node)
-                        encode_message(g, output_store_node)
-                    else:
-                        if layers[layer_end - 1].is_attn == True:
-                            # Send output (to the next layer in another npu group)
-                            send_output_node = self.get_comm_node(
-                                is_send=True,
-                                layer_name=layers[layer_end].name,
-                                comm_type=layers[layer_end].comm_type,
-                                comm_size=layers[layer_end].input_memory_size // npus_per_group,
-                                comm_src=npu_id,
-                                comm_dst=npu_id + npus_per_group
-                            )
-                        else:
-                            send_output_node = self.get_comm_node(
-                                is_send=True,
-                                layer_name=layers[layer_end - 1].name,
-                                comm_type=layers[layer_end - 1].comm_type,
-                                comm_size=layers[layer_end - 1].output_memory_size // npus_per_group,
-                                comm_src=npu_id,
-                                comm_dst=npu_id + npus_per_group
-                            )
-                        if layers[layer_end - 1].comm_type != "NONE" and use_comm:
-                            self.add_parent(send_output_node, comm_coll_node)
-                        elif layers[layer_end - 1].comp_node != None:
-                            self.add_parent(send_output_node, comp_node)
-                        else:
-                            self.add_parent(send_output_node, layers[layer_end - 2].comp_node)
-                        encode_message(g, send_output_node)
-            remain_layers -= 1
-
-        # start PIM POOL
-        layer_start = 0
-        layer_end = 0
-        for npu_group in range(num_npu_group):
-            layer_start = layer_end
-            layer_end = layer_start + layers_per_group + (1 if remain_layers > 0 else 0)
-            if layer_end >= num_layers:
-                layer_end = num_layers
-            for npu_offset in range(npus_per_group):
-                npu_id = npu_group * npus_per_group + npu_offset + self.num_npus
-                output_filename = "%s.%d.et" % (self.output_filename, npu_id)
-                with open(output_filename, "wb") as g:
-                    global_metadata = self.get_global_metadata()
-                    encode_message(g, global_metadata)
-                    if evict != None:
-                        encode_message(g, evict)
-                    if load != None:
-                        encode_message(g, load)
-
-                    attn_start = False
-                    layer_num = layer_start
-                    pim = False
-                    send_id = 0
-                    send_output_node = None
-
-                    while attn_start or layer_num < layer_end:
-                        # check attention layer
-                        if layers[layer_num].is_attn == False:
-                            # check pim
-                            if 'pim' in layers[layer_num].name:
-                                pim = True
-                                # recieve layer
-                                receive_input_node = self.get_comm_node(
-                                        is_send=False,
-                                        layer_name=layers[layer_num].name,
-                                        comm_type=layers[layer_num].comm_type,
-                                        comm_size=layers[layer_num].input_memory_size,
-                                        comm_src=npu_id - self.num_npus,
-                                        comm_dst=npu_id,
-                                        id=send_id
-                                )
-                                # print(npu_id, receive_input_node.comm_tag, receive_input_node.comm_src, receive_input_node.comm_dst, receive_input_node.comm_size)
-                                if send_output_node != None: # For first pim command
-                                    self.add_parent(receive_input_node, send_output_node)
-                                encode_message(g, receive_input_node)
-                                # compute gemm
-                                comp_node = self.get_comp_node(
-                                        layers[layer_num].name, 
-                                        layers[layer_num].comp_time)
-                                layers[layer_num].comp_node = comp_node
-                                self.add_parent(comp_node, receive_input_node)
-                                encode_message(g, comp_node)
-                            else:
-                                # last layer was pim, send to npu
-                                if pim:
-                                    send_output_node = self.get_comm_node(
-                                    is_send=True,
-                                    layer_name=layers[layer_num].name,
-                                    comm_type=layers[layer_num].comm_type,
-                                    comm_size=layers[layer_num].input_memory_size,
-                                    comm_src=npu_id,
-                                    comm_dst=npu_id - self.num_npus,
-                                    id=send_id
-                                    )
-                                    # print(npu_id, send_output_node.comm_tag, send_output_node.comm_src, send_output_node.comm_dst, send_output_node.comm_size)
-                                    self.add_parent(send_output_node, comp_node)
-                                    encode_message(g, send_output_node)
-                                    pim = False
-                                    send_id += 1
-                            # add layer_num
-                            layer_num += 1
-                        # attention layer starts
-                        else:
-                            attn_start = True
-                            # check attention end
-                            if layers[layer_num].attn_num == 'END':
-                                attn_start = False
-                                layer_num += 1
-                                continue
-                            attn_id = int(layers[layer_num].attn_num) % npus_per_group
-                            if npu_offset != attn_id:
-                                # go to next attention
-                                while True:
-                                    layer_num += 1
-                                    if layers[layer_num].is_attn:
-                                        break
-                            else:
-                                layer_num += 1
-
-                    # update new layer_end
-                    layer_end = layer_num
             remain_layers -= 1
 
     def convert_event(self, f: TextIOWrapper, num_layers: int):
@@ -1113,10 +881,6 @@ class LLMConverter:
                 if num_npu_group <= 0:
                     raise ValueError(f"model_parallel_NPU_group <= 0")
                 self.convert_common(f, num_layers, num_npu_group)
-            elif execution_type == "PIM_POOL":
-                if num_npu_group <= 0:
-                    raise ValueError(f"model_parallel_NPU_group <= 0")
-                self.convert_pim(f, num_layers, num_npu_group)
             elif execution_type == "EVENT":
                 self.convert_event(f, num_layers)
             else:

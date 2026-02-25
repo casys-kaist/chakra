@@ -33,6 +33,10 @@ ETFeederNode::ETFeederNode(std::shared_ptr<ChakraProtoMsg::Node> node) {
       this->tensor_size_ = attr.uint64_val();
     } else if (attr_name == "tensor_loc") {
       this->tensor_loc_ = attr.uint32_val();
+    } else if (attr_name == "tensor_device") {
+      this->tensor_device_ = attr.uint32_val();
+    } else if (attr_name == "tensor_channel") {
+      this->tensor_channel_ = attr.uint32_val();
     } else if (attr_name == "comm_type") {
       this->comm_type_ =
           static_cast<ChakraProtoMsg::CollectiveCommType>(attr.int64_val());
@@ -125,6 +129,14 @@ uint64_t ETFeederNode::num_ops() {
 
 uint32_t ETFeederNode::tensor_loc() {
   return tensor_loc_;
+}
+
+uint32_t ETFeederNode::tensor_device() {
+  return tensor_device_;
+}
+
+uint32_t ETFeederNode::tensor_channel() {
+  return tensor_channel_;
 }
 
 uint64_t ETFeederNode::tensor_size() {

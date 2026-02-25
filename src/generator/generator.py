@@ -12,6 +12,7 @@ from ...schema.protobuf.et_def_pb2 import (
     COMP_NODE,
     MEM_LOAD_NODE,
     MEM_STORE_NODE,
+    PIM_COMP_NODE,
     METADATA_NODE,
     REDUCE_SCATTER,
     BoolList,

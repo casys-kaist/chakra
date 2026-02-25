@@ -110,10 +110,11 @@ enum NodeType {
   METADATA_NODE = 1;
   MEM_LOAD_NODE = 2;
   MEM_STORE_NODE = 3;
-  COMP_NODE = 4;
-  COMM_SEND_NODE = 5;
-  COMM_RECV_NODE = 6;
-  COMM_COLL_NODE = 7;
+  PIM_COMP_NODE = 4;
+  COMP_NODE = 5;
+  COMM_SEND_NODE = 6;
+  COMM_RECV_NODE = 7;
+  COMM_COLL_NODE = 8;
 }
 
 enum CollectiveCommType {
