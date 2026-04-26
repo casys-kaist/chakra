@@ -26,11 +26,12 @@ class Layer:
             if col[0] == 'EXPERT': # If Expert Flag
                 self.name = col[0]
                 self.expert_num = col[1]
+                self.comm_type, self.involved_dim = self._parse_comm_type(str(col[2]) if len(col) > 2 else "NONE")
+                self.comm_size = int(col[3]) if len(col) > 3 else 0
                 self.is_expert = True
                 self.is_pim = False
                 self.comm_node = None
                 self.comp_node = None
-                self.comm_type = "ALLTOALL"
             elif col[0] == 'PIM': # If PIM Flag
                 self.name = col[0]
                 self.pim_num = col[1]
@@ -39,6 +40,7 @@ class Layer:
                 self.comm_node = None
                 self.comp_node = None
                 self.comm_type = "NONE"
+                self.involved_dim = None
             else:
                 self.is_expert = False
                 self.is_pim = False
@@ -59,14 +61,28 @@ class Layer:
                 self.output_memory_size = int(col[7])
                 self.output_memory_node = None
 
-                # communication
-                self.comm_type = str(col[8])
+                # communication (supports ALLREDUCE:1,0 format for involved_dim)
+                self.comm_type, self.involved_dim = self._parse_comm_type(str(col[8]))
                 self.comm_size = int(col[9])
                 self.comm_node = None
 
                 self.misc = str(col[10])
         except:
             raise ValueError(f"Cannot parse the following layer -- \"{line}\"")
+
+    @staticmethod
+    def _parse_comm_type(s: str):
+        """Parse comm_type string, extracting optional involved_dim.
+
+        'ALLREDUCE:1,0' -> ('ALLREDUCE', [True, False])
+        'ALLTOALL'      -> ('ALLTOALL', None)
+        'NONE'          -> ('NONE', None)
+        """
+        if ':' in s:
+            comm_type, dim_str = s.split(':', 1)
+            involved_dim = [v == '1' for v in dim_str.split(',')]
+            return comm_type, involved_dim
+        return s, None
         
 class LLMConverter:
     def __init__(
@@ -138,10 +154,14 @@ class LLMConverter:
             return REDUCE_SCATTER
         return 0
     
-    def get_comm_coll_node(self, layer_name: str, comm_type: str, comm_size: int) -> Any:
+    def get_comm_coll_node(self, layer_name: str, comm_type: str, comm_size: int,
+                           involved_dim: list = None) -> Any:
         node = self.get_node(f"COMM_COLL_NODE_{layer_name}_{comm_type}", COMM_COLL_NODE)
         node.attr.append(ChakraAttr(name="comm_type", int64_val=self.get_comm_type(comm_type)))
         node.attr.append(ChakraAttr(name="comm_size", int64_val=comm_size))
+        if involved_dim is not None:
+            node.attr.append(ChakraAttr(name="involved_dim",
+                                        bool_list=BoolList(values=involved_dim)))
         return node
 
     def get_comm_node(self, is_send: bool, layer_name: str, comm_type: str, comm_size: int,
@@ -395,7 +415,6 @@ class LLMConverter:
                                         elif layers[layer_num - 1].comp_node != None:
                                             self.add_parent(comp_node, layers[layer_num - 1].comp_node)
                                         else:
-                                            print(layers[layer_num - 2].name, layers[layer_num - 1].name, layers[layer_num].name)
                                             self.add_parent(comp_node, layers[layer_num - 2].comp_node)
 
                                 # handle pim_compute_mode dependency & should not be remaining attention
@@ -430,7 +449,7 @@ class LLMConverter:
 
                             # Communication (if required)
                             if layers[layer_num].comm_type != "NONE" and use_comm:
-                                comm_coll_node = self.get_comm_coll_node(layers[layer_num].name, layers[layer_num].comm_type, layers[layer_num].comm_size)
+                                comm_coll_node = self.get_comm_coll_node(layers[layer_num].name, layers[layer_num].comm_type, layers[layer_num].comm_size, layers[layer_num].involved_dim)
                                 # for j in range(self.num_dims):
                                 # comm_coll_node.involved_dim.append(True)
                                 layers[layer_num].comm_node = comm_coll_node
@@ -441,9 +460,10 @@ class LLMConverter:
                             layer_num += 1
                         # expert layer starts
                         elif layers[layer_num].is_expert:
-                            if expert_start == False and use_comm:
+                            # communication can happen even with one NPU in the group, for example, expert input gathering in data parallel
+                            if expert_start == False and layers[layer_num].comm_size > 0 and layers[layer_num].comm_type != "NONE": 
                                 # Start of expert, add ALLTOALL communication before expert computation
-                                comm_coll_node = self.get_comm_coll_node("expert_start", layers[layer_num].comm_type, layers[layer_num-1].output_memory_size)
+                                comm_coll_node = self.get_comm_coll_node("expert_start", layers[layer_num].comm_type, layers[layer_num].comm_size, layers[layer_num].involved_dim)
                                 layers[layer_num].comm_node = comm_coll_node
                                 self.add_parent(comm_coll_node, comp_node)
                                 encode_message(g, comm_coll_node)
@@ -452,13 +472,13 @@ class LLMConverter:
                             if layers[layer_num].expert_num == 'END':
                                 expert_start = False
                                 layers[layer_num].comp_node = comp_node # is latest comp_node
-                                layer_num += 1
                                 # End of expert, add ALLTOALL communication after expert computation
-                                if use_comm:
-                                    comm_coll_node = self.get_comm_coll_node("expert_end", layers[layer_num].comm_type, layers[layer_num+1].input_memory_size)
+                                if layers[layer_num].comm_size > 0 and layers[layer_num].comm_type != "NONE":
+                                    comm_coll_node = self.get_comm_coll_node("expert_end", layers[layer_num].comm_type, layers[layer_num].comm_size, layers[layer_num].involved_dim)
                                     layers[layer_num].comm_node = comm_coll_node
                                     self.add_parent(comm_coll_node, comp_node)
                                     encode_message(g, comm_coll_node)
+                                layer_num += 1
                                 continue
                             # round robin assignment
                             expert_id = int(layers[layer_num].expert_num) % npus_per_group
@@ -738,7 +758,7 @@ class LLMConverter:
 
                             # Communication (if required)
                             if layers[layer_num].comm_type != "NONE" and use_comm:
-                                comm_coll_node = self.get_comm_coll_node(layers[layer_num].name, layers[layer_num].comm_type, layers[layer_num].comm_size)
+                                comm_coll_node = self.get_comm_coll_node(layers[layer_num].name, layers[layer_num].comm_type, layers[layer_num].comm_size, layers[layer_num].involved_dim)
                                 # for j in range(self.num_dims):
                                 # comm_coll_node.involved_dim.append(True)
                                 layers[layer_num].comm_node = comm_coll_node
@@ -749,9 +769,10 @@ class LLMConverter:
                             layer_num += 1
                         # expert layer starts
                         elif layers[layer_num].is_expert:
-                            if expert_start == False and use_comm:
+                            # communication can happen even with one NPU in the group, for example, expert input gathering in data parallel
+                            if expert_start == False and layers[layer_num].comm_size > 0 and layers[layer_num].comm_type != "NONE": 
                                 # Start of expert, add ALLTOALL communication before expert computation
-                                comm_coll_node = self.get_comm_coll_node("expert_start", layers[layer_num].comm_type, layers[layer_num-1].output_memory_size)
+                                comm_coll_node = self.get_comm_coll_node("expert_start", layers[layer_num].comm_type, layers[layer_num].comm_size, layers[layer_num].involved_dim)
                                 layers[layer_num].comm_node = comm_coll_node
                                 self.add_parent(comm_coll_node, comp_node)
                                 encode_message(g, comm_coll_node)
@@ -760,13 +781,13 @@ class LLMConverter:
                             if layers[layer_num].expert_num == 'END':
                                 expert_start = False
                                 layers[layer_num].comp_node = comp_node # is latest comp_node
-                                layer_num += 1
                                 # End of expert, add ALLTOALL communication after expert computation
-                                if use_comm:
-                                    comm_coll_node = self.get_comm_coll_node("expert_end", layers[layer_num].comm_type, layers[layer_num+1].input_memory_size)
+                                if layers[layer_num].comm_size > 0 and layers[layer_num].comm_type != "NONE":
+                                    comm_coll_node = self.get_comm_coll_node("expert_end", layers[layer_num].comm_type, layers[layer_num].comm_size, layers[layer_num].involved_dim)
                                     layers[layer_num].comm_node = comm_coll_node
                                     self.add_parent(comm_coll_node, comp_node)
                                     encode_message(g, comm_coll_node)
+                                layer_num += 1
                                 continue
                             # round robin assignment
                             expert_id = int(layers[layer_num].expert_num) % npus_per_group
