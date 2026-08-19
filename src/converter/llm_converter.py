@@ -731,13 +731,21 @@ class LLMConverter:
                                 
                                 encode_message(g, comp_node)
 
-                                # Send KV cache after each kv_proj
-                                if "v_proj" in layers[layer_num].name:
+                                # Send KV cache after each kv_proj.
+                                # comm_size comes from the trace's comm_size
+                                # column, which the frontend fills with the
+                                # per-layer, per-rank K+V bytes. It used to read
+                                # output_memory_size, i.e. the whole QKV
+                                # activation, which shipped Q as well and
+                                # overstated the transfer by
+                                # (q_dim + 2*kv_dim) / (2*kv_dim) -- 3x for
+                                # Llama-3.1-8B -- and ignored kv_cache_dtype.
+                                if "v_proj" in layers[layer_num].name and layers[layer_num].comm_size > 0:
                                     send_kv_node = self.get_comm_node(
                                         is_send=True,
                                         layer_name="kv_proj",
                                         comm_type=layers[layer_num].comm_type,
-                                        comm_size=layers[layer_num].output_memory_size,
+                                        comm_size=layers[layer_num].comm_size,
                                         comm_src=npu_id,
                                         comm_dst=npu_id + self.num_npus, # to the paired npu in decode
                                         id=layer_num
@@ -749,7 +757,7 @@ class LLMConverter:
                                         is_send=False,
                                         layer_name="kv_proj",
                                         comm_type=layers[layer_num].comm_type,
-                                        comm_size=layers[layer_num].output_memory_size,
+                                        comm_size=layers[layer_num].comm_size,
                                         comm_src=npu_id,
                                         comm_dst=npu_id + self.num_npus,
                                         id=layer_num
