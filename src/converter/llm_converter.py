@@ -571,11 +571,25 @@ class LLMConverter:
 
                     if npu_group == (num_npu_group - 1):
                         # Store output (for the last layer)
+                        # The last layer is the sampler: what crosses back to
+                        # the host is its OUTPUT, the sampled token ids, 4 bytes
+                        # per sequence.
+                        #
+                        # Do not switch this back to input_memory_size. That read
+                        # was a deliberate down-scaling when lm_head was the last
+                        # trace layer: its output is the logits
+                        # (num_seqs * vocab_size * dtype) and billing those to CPU
+                        # memory every iteration was a large overcharge, so the
+                        # smaller input (the hidden state) stood in. Once sampler
+                        # was appended as the new last layer the two swapped
+                        # roles -- sampler's output is the token ids and its input
+                        # is the logits -- so reading the input landed back on
+                        # exactly the tensor the workaround existed to avoid.
                         output_store_node = self.get_memory_store_node(
                             layers[layer_end - 1].name,
                             "OUTPUT",
                             layers[layer_end - 1].output_memory_loc,
-                            layers[layer_end - 1].input_memory_size,
+                            layers[layer_end - 1].output_memory_size,
                         )
                         # if pim_comp_nodes are not consumed yet, add dependency
                         if len(pim_comp_nodes) != 0:
