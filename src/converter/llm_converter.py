@@ -532,7 +532,7 @@ class LLMConverter:
                             elif int(layers[layer_num].pim_num) == 0:
                                 if first_comp_node:
                                     if npu_group == 0:
-                                        pim_parent_nodes.append()
+                                        pim_parent_nodes.append(input_load_node)
                                     else:
                                         pim_parent_nodes.append(receive_input_node)
                                     if evict != None:
