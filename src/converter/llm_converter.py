@@ -105,12 +105,25 @@ class LLMConverter:
         self.comm_tag_dict = dict()
 
     def get_global_metadata(self):
-        input_text = ""
-        with open(self.input_filename, "r") as input_file:
-            input_text = input_file.read()
+        # ``input_file`` carries the trace's *path*, not its contents.
+        #
+        # It used to embed the whole trace text. Nothing consumes it:
+        # ETFeeder::readGlobalMetadata() reads the message into a local
+        # shared_ptr and drops it on the floor, and no other reader touches
+        # the attribute. So every byte of it was written by the converter,
+        # re-parsed by the feeder's protobuf reader, and discarded.
+        #
+        # It was not a small overhead. On the swe-bench MoE DP+EP example a
+        # trace is ~82 KB of a 117 KB .et -- 70% of the file -- and the
+        # simulator generates 8,810 of them for one session, so it was
+        # ~720 MB of encode/write/read/parse per run, plus a second full
+        # read of the trace file here purely to obtain the text.
+        #
+        # The path keeps the provenance that made this attribute useful for
+        # debugging; the trace itself is kept on disk by --no-cleanup-inputs.
         attr = [
             ChakraAttr(name="schema", string_val="1.0.2-chakra.0.0.4"),
-            ChakraAttr(name="input_file", string_val=input_text),
+            ChakraAttr(name="input_file", string_val=self.input_filename),
         ]
         metadata = GlobalMetadata(attr=attr)
         return metadata
