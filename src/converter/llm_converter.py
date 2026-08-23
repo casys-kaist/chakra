@@ -126,7 +126,7 @@ class LLMConverter:
         # read of the trace file here purely to obtain the text.
         #
         # The path keeps the provenance that made this attribute useful for
-        # debugging; the trace itself is kept on disk by --no-cleanup-inputs.
+        # debugging; the trace itself is written to disk by --save-trace-text.
         attr = [
             ChakraAttr(name="schema", string_val="1.0.2-chakra.0.0.4"),
             ChakraAttr(name="input_file", string_val=self.input_filename),
