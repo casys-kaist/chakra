@@ -28,8 +28,28 @@ class Layer:
             if col[0] == 'EXPERT': # If Expert Flag
                 self.name = col[0]
                 self.expert_num = col[1]
-                self.comm_type, self.involved_dim = self._parse_comm_type(str(col[2]) if len(col) > 2 else "NONE")
-                self.comm_size = int(col[3]) if len(col) > 3 else 0
+                # An expert marker carries zero or more (comm_type, comm_size)
+                # pairs, emitted in order. One is the common case -- the
+                # dispatch on ``EXPERT 0``, the combine on ``EXPERT END``.
+                # ``EXPERT END`` takes two under sequence-parallel MoE, where
+                # vLLM reduce-scatters over the EP group and then all-gathers
+                # over the TP group to undo the sequence sharding: two
+                # collectives on two different groups, so one pair cannot
+                # describe it. Extra pairs used to be parsed and silently
+                # dropped.
+                self.comms = []
+                for k in range(2, len(col) - 1, 2):
+                    ctype, cdim = self._parse_comm_type(str(col[k]))
+                    csize = int(col[k + 1])
+                    if ctype != "NONE" and csize > 0:
+                        self.comms.append((ctype, csize, cdim))
+                # First pair stays on the old attributes: everything that reads
+                # a marker's collective without iterating still works.
+                if self.comms:
+                    self.comm_type, self.comm_size, self.involved_dim = self.comms[0]
+                else:
+                    self.comm_type, self.involved_dim = self._parse_comm_type("NONE")
+                    self.comm_size = 0
                 self.is_expert = True
                 self.is_pim = False
                 self.comm_node = None
@@ -568,9 +588,12 @@ class LLMConverter:
                             if layers[layer_num].expert_num == 'END':
                                 expert_start = False
                                 layers[layer_num].comp_node = comp_node # is latest comp_node
-                                # End of expert, add ALLTOALL communication after expert computation
-                                if layers[layer_num].comm_size > 0 and layers[layer_num].comm_type != "NONE":
-                                    comm_coll_node = self.get_comm_coll_node("expert_end", layers[layer_num].comm_type, layers[layer_num].comm_size, layers[layer_num].involved_dim)
+                                # End of expert: emit every collective the
+                                # marker carries, in the order it lists them.
+                                for _i, (_ct, _cs, _cd) in enumerate(layers[layer_num].comms):
+                                    comm_coll_node = self.get_comm_coll_node(
+                                        "expert_end" if _i == 0 else f"expert_end_{_i}",
+                                        _ct, _cs, _cd)
                                     layers[layer_num].comm_node = comm_coll_node
                                     self.add_parent(comm_coll_node, comp_node)
                                     encode_message(g, comm_coll_node)
@@ -901,9 +924,12 @@ class LLMConverter:
                             if layers[layer_num].expert_num == 'END':
                                 expert_start = False
                                 layers[layer_num].comp_node = comp_node # is latest comp_node
-                                # End of expert, add ALLTOALL communication after expert computation
-                                if layers[layer_num].comm_size > 0 and layers[layer_num].comm_type != "NONE":
-                                    comm_coll_node = self.get_comm_coll_node("expert_end", layers[layer_num].comm_type, layers[layer_num].comm_size, layers[layer_num].involved_dim)
+                                # End of expert: emit every collective the
+                                # marker carries, in the order it lists them.
+                                for _i, (_ct, _cs, _cd) in enumerate(layers[layer_num].comms):
+                                    comm_coll_node = self.get_comm_coll_node(
+                                        "expert_end" if _i == 0 else f"expert_end_{_i}",
+                                        _ct, _cs, _cd)
                                     layers[layer_num].comm_node = comm_coll_node
                                     self.add_parent(comm_coll_node, comp_node)
                                     encode_message(g, comm_coll_node)
