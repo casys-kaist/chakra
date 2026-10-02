@@ -10,6 +10,17 @@ A detailed description of the original motivation and guiding principles can be 
 
 ## Installation
 
+### LLMServingSim expert-region dependencies
+
+The LLM converter emits every collective carried by an expert boundary in
+order. Each operation depends on the previous operation, and subsequent
+computation retains the resulting tail even when a rank skips another rank's
+expert rows. This preserves component/dispatch/combine ordering in COLOCATED
+and PREFILL traces, including pipeline stage boundaries. Logical collectives
+are not merged into a synthetic tensor or assumed to share a kernel startup.
+Reinstall this package after changing the converter; simulator environments
+normally import its installed copy rather than this source tree.
+
 Check out [`USER_GUIDE`](USER_GUIDE.md) for details.
 
 ## License

@@ -355,6 +355,22 @@ class LLMConverter:
     def add_parent(self, child_node: Any, parent_node: Any) -> None:
         child_node.data_deps.append(parent_node.id)
 
+    def emit_expert_collectives(self, stream, marker, parent, prefix):
+        """Retain each logical tensor and its dependency order.
+
+        Native NCCL may group these calls into fewer kernels. This trace uses
+        separate analytical collective costs; it does not infer kernel fusion
+        or collapse physical tensors into one payload.
+        """
+        for index, (kind, size, dims) in enumerate(marker.comms):
+            name = prefix if index == 0 else f"{prefix}_{index}"
+            node = self.get_comm_coll_node(name, kind, size, dims)
+            self.add_parent(node, parent)
+            encode_message(stream, node)
+            marker.comm_node = node
+            parent = node
+        return parent
+
     def get_stage_edges(self, num_layers: int, num_npu_group: int,
                         stage_boundaries: List[int]) -> List[Any]:
         """Resolve the [start, end) trace-line range owned by each pipeline stage.
@@ -577,28 +593,20 @@ class LLMConverter:
                         # expert layer starts
                         elif layers[layer_num].is_expert:
                             # communication can happen even with one NPU in the group, for example, expert input gathering in data parallel
-                            if expert_start == False and layers[layer_num].comm_size > 0 and layers[layer_num].comm_type != "NONE": 
-                                # Start of expert, add ALLTOALL communication before expert computation
-                                comm_coll_node = self.get_comm_coll_node("expert_start", layers[layer_num].comm_type, layers[layer_num].comm_size, layers[layer_num].involved_dim)
-                                layers[layer_num].comm_node = comm_coll_node
-                                self.add_parent(comm_coll_node, comp_node)
-                                encode_message(g, comm_coll_node)
-                            expert_start = True
-                            # check expert end
-                            if layers[layer_num].expert_num == 'END':
+                            marker = layers[layer_num]
+                            if marker.expert_num == 'END':
                                 expert_start = False
-                                layers[layer_num].comp_node = comp_node # is latest comp_node
-                                # End of expert: emit every collective the
-                                # marker carries, in the order it lists them.
-                                for _i, (_ct, _cs, _cd) in enumerate(layers[layer_num].comms):
-                                    comm_coll_node = self.get_comm_coll_node(
-                                        "expert_end" if _i == 0 else f"expert_end_{_i}",
-                                        _ct, _cs, _cd)
-                                    layers[layer_num].comm_node = comm_coll_node
-                                    self.add_parent(comm_coll_node, comp_node)
-                                    encode_message(g, comm_coll_node)
+                                marker.comp_node = comp_node
+                                comp_node = self.emit_expert_collectives(g, marker, comp_node, 'expert_end')
+                                if marker.comm_node is not None:
+                                    comm_coll_node = marker.comm_node
                                 layer_num += 1
                                 continue
+                            if not expert_start:
+                                comp_node = self.emit_expert_collectives(g, marker, comp_node, 'expert_start')
+                                if marker.comm_node is not None:
+                                    comm_coll_node = marker.comm_node
+                            expert_start = True
                             # round robin assignment
                             expert_id = int(layers[layer_num].expert_num) % npus_per_group
                             if npu_offset != expert_id:
@@ -913,28 +921,20 @@ class LLMConverter:
                         # expert layer starts
                         elif layers[layer_num].is_expert:
                             # communication can happen even with one NPU in the group, for example, expert input gathering in data parallel
-                            if expert_start == False and layers[layer_num].comm_size > 0 and layers[layer_num].comm_type != "NONE": 
-                                # Start of expert, add ALLTOALL communication before expert computation
-                                comm_coll_node = self.get_comm_coll_node("expert_start", layers[layer_num].comm_type, layers[layer_num].comm_size, layers[layer_num].involved_dim)
-                                layers[layer_num].comm_node = comm_coll_node
-                                self.add_parent(comm_coll_node, comp_node)
-                                encode_message(g, comm_coll_node)
-                            expert_start = True
-                            # check expert end
-                            if layers[layer_num].expert_num == 'END':
+                            marker = layers[layer_num]
+                            if marker.expert_num == 'END':
                                 expert_start = False
-                                layers[layer_num].comp_node = comp_node # is latest comp_node
-                                # End of expert: emit every collective the
-                                # marker carries, in the order it lists them.
-                                for _i, (_ct, _cs, _cd) in enumerate(layers[layer_num].comms):
-                                    comm_coll_node = self.get_comm_coll_node(
-                                        "expert_end" if _i == 0 else f"expert_end_{_i}",
-                                        _ct, _cs, _cd)
-                                    layers[layer_num].comm_node = comm_coll_node
-                                    self.add_parent(comm_coll_node, comp_node)
-                                    encode_message(g, comm_coll_node)
+                                marker.comp_node = comp_node
+                                comp_node = self.emit_expert_collectives(g, marker, comp_node, 'expert_end')
+                                if marker.comm_node is not None:
+                                    comm_coll_node = marker.comm_node
                                 layer_num += 1
                                 continue
+                            if not expert_start:
+                                comp_node = self.emit_expert_collectives(g, marker, comp_node, 'expert_start')
+                                if marker.comm_node is not None:
+                                    comm_coll_node = marker.comm_node
+                            expert_start = True
                             # round robin assignment
                             expert_id = int(layers[layer_num].expert_num) % npus_per_group
                             if npu_offset != expert_id:
